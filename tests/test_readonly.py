@@ -391,7 +391,7 @@ class AimPolicyTests(unittest.TestCase):
         m.write64(snap+6216, 1000000000)
         m.uc.mem_write(snap+6228, struct.pack('<f', 5.671282))
         m.write64(snap+6248, 99)
-        m.uc.mem_write(snap+6258, b'\1\1')
+        m.uc.mem_write(snap+6256, b'\1\1\1\1')
         m.write64(snap+6264, ident)
         m.uc.mem_write(VIEW, struct.pack('<2f', 1000, 800))
         return m, snap
@@ -409,8 +409,9 @@ class AimPolicyTests(unittest.TestCase):
         self.assertEqual(m.read64(RESULT), 42)
         self.assertAlmostEqual(struct.unpack('<f', m.uc.mem_read(RESULT+16, 4))[0], 450, places=3)
 
-    def test_rejects_missing_game_target_stale_inactive_wrong_lock_or_scope(self):
-        for kind in ('missing', 'stale', 'future', 'doing', 'lock', 'zoom', 'sniper'):
+    def test_rejects_missing_game_target_stale_inactive_wrong_lock_or_gate(self):
+        for kind in ('missing', 'stale', 'future', 'doing', 'lock', 'scope',
+                     'weapon', 'sniper', 'projection'):
             m, snap = self.fixture(100)
             now, zoom, locked = 1000000000, 5.671282, 42
             if kind == 'missing': m.write64(snap+6264, 43)
@@ -420,24 +421,29 @@ class AimPolicyTests(unittest.TestCase):
                 m.uc.mem_write(snap+6259, b'\0')
                 locked = 0
             if kind == 'lock': locked = 43
-            if kind == 'zoom': zoom = 4.0
+            if kind == 'scope': m.uc.mem_write(snap+6257, b'\0')
+            if kind == 'weapon': m.uc.mem_write(snap+6256, b'\0')
             if kind == 'sniper': m.uc.mem_write(snap+6258, b'\0')
+            if kind == 'projection': zoom = 0.0
             self.assertEqual(self.choose(m, snap, locked, now, zoom), 0, kind)
             self.assertEqual(bytes(m.uc.mem_read(RESULT, 24)), bytes(24))
 
-    def test_game_trigger_requires_sniper_flag_and_full_scope_projection(self):
-        for sniper, projection, expected in [
-                (0, 1.25, 0), (0, 5.671282, 0),
-                (1, 1.25, 0), (1, 5.671282, 1)]:
+    def test_game_trigger_requires_sniper_weapon_zoom_and_sniper_flag(self):
+        for weapon, zooming, sniper, projection, expected in [
+                (0, 1, 1, 5.671282, 0),
+                (1, 0, 1, 5.671282, 0),
+                (1, 1, 0, 5.671282, 0),
+                (1, 1, 1, 0.0, 0),
+                (1, 1, 1, 1.25, 1),
+                (1, 1, 1, 5.671282, 1)]:
             m, snap = self.fixture(100)
-            m.uc.mem_write(snap+6258, bytes([sniper]))
+            m.uc.mem_write(snap+6256, bytes([weapon, zooming, sniper]))
             self.assertEqual(self.choose(m, snap, locked=0,
                                          projection=projection), expected)
 
-    def test_builtin_aim_flag_does_not_block_active_game_target(self):
+    def test_low_valid_projection_is_not_treated_as_a_scope_flag(self):
         m, snap = self.fixture(100)
-        m.uc.mem_write(snap+6256, b'\1')
-        self.assertEqual(self.choose(m, snap, 42), 1)
+        self.assertEqual(self.choose(m, snap, 42, projection=1.25), 1)
         self.assertEqual(m.read64(RESULT), 42)
 
     def test_game_doing_state_is_authoritative_over_visible_field(self):
@@ -483,7 +489,7 @@ class GyroControllerTests(unittest.TestCase):
         m.write64(snap+6216, 1000000000)
         m.uc.mem_write(snap+6228, struct.pack('<f', projection))
         m.write64(snap+6248, 99)
-        m.uc.mem_write(snap+6258, b'\1\1')  # sniper enabled + doing
+        m.uc.mem_write(snap+6256, b'\1\1\1\1')
         m.write64(snap+6264, 42)
         m.uc.mem_write(VIEW, struct.pack('<2f', 1000, 800))
         m.uc.mem_write(self.STATE, bytes(256))
@@ -516,7 +522,8 @@ class GyroControllerTests(unittest.TestCase):
         self.assertLessEqual(abs(sy), .15)
 
     def test_trigger_is_idle_until_sniper_scope_is_open(self):
-        m, snap = self.fixture(projection=4.0)
+        m, snap = self.fixture()
+        m.uc.mem_write(snap+6257, b'\0')
         self.assertEqual(self.step(m, snap), 0)
         self.assertEqual(self.command(m), (0, 0, 0, 0, 0, 0, False, False))
 
@@ -576,12 +583,14 @@ class GyroControllerTests(unittest.TestCase):
         target, _, _, sx, sy, mode, active, _ = self.command(m)
         self.assertEqual((target, sx, sy, mode, active), (42, 0, 0, 2, False))
 
-    def test_trigger_requires_sniper_flag_and_scope(self):
-        for sniper, projection in ((0, 1.25), (0, 5.671282),
-                                    (1, 1.25), (1, 5.671282)):
+    def test_trigger_requires_sniper_weapon_zoom_and_sniper_flag(self):
+        for weapon, zooming, sniper, projection in (
+                (0, 1, 1, 5.671282), (1, 0, 1, 5.671282),
+                (1, 1, 0, 5.671282), (1, 1, 1, 1.25),
+                (1, 1, 1, 5.671282)):
             m, snap = self.fixture(projection=projection)
-            m.uc.mem_write(snap+6258, bytes([sniper]))
-            expected = int(sniper == 1 and projection >= 5.30)
+            m.uc.mem_write(snap+6256, bytes([weapon, zooming, sniper]))
+            expected = int(weapon == zooming == sniper == 1)
             self.assertEqual(self.step(m, snap), expected)
             target, _, _, sx, sy, mode, active, settled = self.command(m)
             if expected:
@@ -625,7 +634,7 @@ class SceneModePolicyTests(unittest.TestCase):
         snap = DATA + 0x2000
         m.uc.mem_write(snap, bytes(6272))
         m.uc.mem_write(snap+6228, struct.pack('<f', 5.671282))
-        m.uc.mem_write(snap+6258, b'\1\1')
+        m.uc.mem_write(snap+6256, b'\1\1\1\1')
         m.write64(snap+6264, 42)
         self.assertEqual(m.call('cf_scene_sniper_scope_active', snap), 1)
         self.assertEqual(m.call('cf_scene_needs_targets', snap, 0, 1, 0), 1)
@@ -635,11 +644,22 @@ class SceneModePolicyTests(unittest.TestCase):
         m.uc.mem_write(snap+6259, b'\0')
         self.assertEqual(m.call('cf_scene_needs_targets', snap, 1, 0, 42), 1)
         m.uc.mem_write(snap+6259, b'\1')
-        m.uc.mem_write(snap+6228, struct.pack('<f', 4.0))
+        m.uc.mem_write(snap+6257, b'\0')
         self.assertEqual(m.call('cf_scene_needs_targets', snap, 1, 0, 42), 0)
-        m.uc.mem_write(snap+6228, struct.pack('<f', 5.671282))
+        m.uc.mem_write(snap+6257, b'\1')
         m.uc.mem_write(snap+6258, b'\0')
         self.assertEqual(m.call('cf_scene_needs_targets', snap, 1, 0, 42), 0)
+
+    def test_poll_interval_follows_lobby_weapon_and_trigger_tiers(self):
+        m = machine()
+        snap = DATA + 0x2000
+        m.uc.mem_write(snap, bytes(6272))
+        self.assertEqual(m.call('cf_scene_poll_interval_us', 0), 5000000)
+        self.assertEqual(m.call('cf_scene_poll_interval_us', snap), 5000000)
+        m.write64(snap+6248, 99)
+        self.assertEqual(m.call('cf_scene_poll_interval_us', snap), 500000)
+        m.uc.mem_write(snap+6256, b'\1')
+        self.assertEqual(m.call('cf_scene_poll_interval_us', snap), 8000)
 
 
 class TransformTests(unittest.TestCase):
@@ -988,8 +1008,8 @@ class RuntimeTests(unittest.TestCase):
                     m.uc.mem_write(snap+6228, struct.pack(
                         '<f', 5.671282 if active else 1.25))
                     m.write64(snap+6248, 99)
-                    m.uc.mem_write(snap+6258,
-                                   b'\1\1' if active else b'\1\0')
+                    m.uc.mem_write(snap+6256,
+                                   b'\1\1\1\1' if active else b'\1\0\1\0')
                     m.write64(snap+6264, 42 if active else 0)
                     m.uc.mem_write(m.reg(2), b'\0')
                     ret(1)

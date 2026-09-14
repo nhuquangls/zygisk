@@ -2,7 +2,7 @@
 
 ui_print "- Runtime Shim - native compatibility module"
 ui_print "- Runtime helper for the tested 2944x1840 HUD"
-ui_print "- Direct-target sniper gyro aim with 500 ms finish grace"
+ui_print "- Sniper gyro aim with adaptive 5000/500/8 ms polling"
 ui_print "- Target: com.vnggames.cfl.crossfirelegends"
 ui_print "- ABI: arm64-v8a"
 

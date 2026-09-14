@@ -605,3 +605,32 @@ Bản đã cài và reboot trên `192.168.5.102:5555`; module active đúng
 payload `c1d3ad09261b1b700246940b1c77561dcc069b1a3d7e057f7bdc9538e9696fb4`
 khớp staging. Game PID 6095 nạp Unity/IL2CPP và anonymous payload, không crash
 hay sinh log module; ZIP tạm đã được xóa.
+
+### v2.6.0-adaptive-poll
+
+Probe read-only trên build đã pin xác nhận `Pawn.get_CurrentWeapon()` ở RVA
+`0x6876c98`. Khi cầm sniper, object trả về thuộc `WNGameBase.WNWeaponSniper`;
+field trực tiếp `WNWeaponSniper.m_IsZooming` đổi chính xác từ 0 sang 1 khi mở
+scope. Với súng thường, current weapon không assignable sang class sniper.
+`WNPawn.m_IsInZoomingState` không đổi theo scope trong phép đo nên không được
+dùng. Gate `projection_y >= 5.30` cũng được bỏ hoàn toàn; `projection_y` chỉ còn
+tham gia phép chiếu sai số màn hình sang gyro.
+
+Worker dùng ba cadence thích nghi. Khi chưa bind được local pawn trong trận,
+scene rebind chạy mỗi **5000 ms**. Sau khi đã bind nhưng current weapon chưa phải
+sniper, getter current weapon được gọi tối đa mỗi **500 ms**. Khi đã cache sniper,
+worker chạy mỗi **8 ms**: scope đóng chỉ đọc trực tiếp `m_IsZooming` rồi return;
+scope mở mới đọc `m_EnableAimAssistanceForSniper`, `m_DoingAimAssist`,
+`m_CurrentAimAssistTarget` và hệ số projection. Transform cùng full camera matrix
+chỉ được đọc khi trigger active hoặc đang hoàn tất grace 500 ms; fast path không
+duyệt danh sách enemy. Phân loại current weapon vẫn refresh 500 ms ngay cả khi
+worker đang ở nhịp 8 ms.
+
+Build release đạt **60/60 test ARM64**; versionCode 260. ZIP SHA-256
+`65DD5C409E55495E693610EB8435159D356EACDC722511FBF36BCC9947F7648B`.
+Bản đã cài và reboot trên `192.168.5.102:5555`; module active đúng
+`2.6.0-adaptive-poll`. Hash loader
+`e25ae04142320432dc9570a31fba5353db3001f9ee83c32d4e3ef7861aacf8fe` và
+payload `bdc742ce8832dcf7d2611ae3a21e0ea4a43c32b5b8effa6e41492f96cb769aec`
+khớp staging. Game PID 5620 nạp Unity/IL2CPP, file payload tạm đã được unlink,
+không còn tên module trong maps, PID ổn định và không có fatal/runtime log.

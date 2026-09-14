@@ -72,7 +72,7 @@ static void *readonly_worker(void *unused) {
     /* Gyro takeover must not share a run with synthetic touch actuation. */
     bool input = false;
     cf_input_enable(false);
-    CfSceneSnapshot snapshot;
+    CfSceneSnapshot snapshot = {0};
     const CfViewport viewport = {2944.0f, 1840.0f};
     CfGyroController controller;
     cf_gyro_controller_reset(&controller);
@@ -109,7 +109,7 @@ static void *readonly_worker(void *unused) {
                 cf_sensor_probe_set_adjustment(false, 0, 0);
             __atomic_store_n(&g_status, CF_WAITING_SCENE, __ATOMIC_RELEASE);
         }
-        usleep(8000);
+        usleep(cf_scene_poll_interval_us(&snapshot));
     }
     cf_sensor_probe_shutdown();
     cf_input_shutdown();

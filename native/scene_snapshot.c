@@ -8,8 +8,10 @@
 #include <string.h>
 #include <time.h>
 
-enum Extra { UPPER, CAMP, ASSIST, SNIPER, DOING, AIM_TARGET, CACHED, EXTRA_COUNT };
+enum Extra { UPPER, CAMP, SNIPER, DOING, AIM_TARGET, CACHED,
+             WEAPON_ZOOMING, EXTRA_COUNT };
 enum Static { MANAGER, CAMERA, POSITION, FORWARD, FRAME, STATIC_COUNT };
+typedef uintptr_t (*GetCurrentWeaponFn)(uintptr_t, const void *);
 struct CfScene {
     MetadataApi api;
     CfMetadataLayout layout;
@@ -22,7 +24,11 @@ struct CfScene {
     struct { uintptr_t klass; unsigned roles; } allowed[32];
     size_t allowed_count;
     uintptr_t cached_pawn, cached_controller, cached_local_player;
-    uint64_t next_bind_ns;
+    uintptr_t cached_weapon;
+    void *sniper_weapon_class;
+    GetCurrentWeaponFn get_current_weapon;
+    uint64_t next_bind_ns, next_weapon_poll_ns;
+    bool cached_weapon_sniper;
 };
 bool cf_scene_candidate_is_enemy(bool individual_mode, int32_t camp,
                                  int32_t local_camp, uintptr_t id,
@@ -30,9 +36,10 @@ bool cf_scene_candidate_is_enemy(bool individual_mode, int32_t camp,
     return id != local_id && (individual_mode || camp != local_camp);
 }
 bool cf_scene_sniper_scope_active(const CfSceneSnapshot *snapshot) {
-    return snapshot && snapshot->sniper_aim_enabled &&
+    return snapshot && snapshot->current_weapon_sniper &&
+           snapshot->sniper_zooming && snapshot->sniper_aim_enabled &&
            isfinite(snapshot->projection_y) &&
-           snapshot->projection_y >= CF_SNIPER_SCOPE_PROJECTION_MIN &&
+           snapshot->projection_y > 0.0f &&
            snapshot->projection_y <= 20.0f;
 }
 bool cf_scene_needs_targets(const CfSceneSnapshot *snapshot, bool tracking,
@@ -42,6 +49,11 @@ bool cf_scene_needs_targets(const CfSceneSnapshot *snapshot, bool tracking,
     bool fresh = trigger && (trigger_armed ||
                              snapshot->game_aim_target != locked_target);
     return tracking || fresh;
+}
+uint32_t cf_scene_poll_interval_us(const CfSceneSnapshot *snapshot) {
+    if (!snapshot || !snapshot->local_id) return CF_SCENE_LOBBY_POLL_US;
+    return snapshot->current_weapon_sniper ? CF_SCENE_TRIGGER_POLL_US
+                                           : CF_SCENE_WEAPON_POLL_US;
 }
 uint64_t cf_monotonic_ns(void) {
     struct timespec now;
@@ -170,11 +182,11 @@ CfScene *cf_scene_open(const CfModule *module, char *error, size_t size) {
     struct { const char *ns, *cl, *field; int kind; size_t width; } specs[] = {
         {"WNEngine", "Pawn", "m_CachedUpperBodyTransform", 18, 8},
         {"WNEngine", "PlayerInfo", "m_Camp", 17, 4},
-        {"WNEngine", "PlayerController", "m_EnableAimAssistance", 2, 1},
         {"WNEngine", "PlayerController", "m_EnableAimAssistanceForSniper", 2, 1},
         {"WNEngine", "PlayerController", "m_DoingAimAssist", 2, 1},
         {"WNEngine", "PlayerController", "m_CurrentAimAssistTarget", 18, 8},
         {"UnityEngine", "Object", "m_CachedPtr", 24, 8},
+        {"WNGameBase", "WNWeaponSniper", "m_IsZooming", 2, 1},
     };
     for (size_t i = 0; i < EXTRA_COUNT; ++i) {
         void *cl = s->api.class_from_name(i == CACHED ? unity_image : game, specs[i].ns, specs[i].cl);
@@ -185,6 +197,15 @@ CfScene *cf_scene_open(const CfModule *module, char *error, size_t size) {
     }
     s->pawn_class = s->api.class_from_name(game, "WNGameBase", "WNPawn");
     s->controller_class = s->api.class_from_name(game, "WNEngine", "PlayerController");
+    s->sniper_weapon_class = s->api.class_from_name(
+        game, "WNGameBase", "WNWeaponSniper");
+    const uintptr_t get_current_weapon_rva = 0x6876c98;
+    if (module->load_bias > UINTPTR_MAX - get_current_weapon_rva ||
+        module->load_bias + get_current_weapon_rva < module->image_begin ||
+        module->load_bias + get_current_weapon_rva >= module->image_end)
+        goto fail;
+    s->get_current_weapon = (GetCurrentWeaponFn)(
+        module->load_bias + get_current_weapon_rva);
     void *mc = s->api.class_from_name(game, "WNEngine", "AttackableTargetsManager");
     void *cc = s->api.class_from_name(game, "WNEngine", "PlayerCamera");
     const char *names[] = {"_Instance", "m_WorldCamera", "m_WorldCameraPosition", "m_WorldCameraForwardDir", "LastWorldCameraUpdateFrame"};
@@ -193,7 +214,8 @@ CfScene *cf_scene_open(const CfModule *module, char *error, size_t size) {
         s->statics[i] = get_field(s, i == MANAGER ? mc : cc, names[i], kinds[i], true);
         if (!s->statics[i]) { snprintf(error, size, "invalid static %s", names[i]); goto fail; }
     }
-    if (!s->pawn_class || !s->controller_class) goto fail;
+    if (!s->pawn_class || !s->controller_class || !s->sniper_weapon_class)
+        goto fail;
     void *(*from_type)(void *) = (void *(*)(void *))cf_exports_function(&ex, "il2cpp_class_from_type");
     if (!from_type) { snprintf(error, size, "missing il2cpp_class_from_type"); goto fail; }
     void *info_class = s->api.class_from_name(game, "WNEngine", "PlayerInfo");
@@ -262,19 +284,36 @@ static bool is_instance(CfScene *s, uintptr_t object, unsigned role) {
         if (s->allowed[i].klass == cl) return !!(s->allowed[i].roles & role);
     return false;
 }
-#define CF_SCENE_REBIND_NS 250000000ULL
+#define CF_SCENE_REBIND_NS 5000000000ULL
+#define CF_WEAPON_POLL_NS 500000000ULL
 
 static void clear_cached_local(CfScene *s) {
     s->cached_pawn = 0;
     s->cached_controller = 0;
     s->cached_local_player = 0;
+    s->cached_weapon = 0;
+    s->cached_weapon_sniper = false;
+    s->next_weapon_poll_ns = 0;
+}
+
+static bool poll_current_weapon(CfScene *s, uintptr_t pawn, uint64_t now) {
+    if (now < s->next_weapon_poll_ns) return true;
+    s->next_weapon_poll_ns = now <= UINT64_MAX - CF_WEAPON_POLL_NS
+                             ? now + CF_WEAPON_POLL_NS : UINT64_MAX;
+    uintptr_t weapon = s->get_current_weapon(pawn, NULL);
+    uintptr_t klass = pointer(weapon, 0);
+    s->cached_weapon = weapon;
+    s->cached_weapon_sniper = weapon && klass &&
+        s->assignable(s->sniper_weapon_class, (void *)klass);
+    return true;
 }
 
 /*
- * The idle path deliberately reads only stable ownership links, the three
- * aim flags/current target and the single projection coefficient used as the
- * sniper-scope gate. It does not touch the attackable list, transforms or the
- * full view/projection matrices.
+ * The idle path deliberately reads only stable ownership links and the cached
+ * current-weapon classification. Non-sniper sessions stop there and
+ * are revisited at 500 ms. Once a sniper is cached, the 8 ms trigger path reads
+ * its direct zoom flag, controller aim state and one projection coefficient.
+ * It does not touch the attackable list, transforms or full camera matrices.
  */
 static bool poll_cached_local(CfScene *s, CfSceneSnapshot *out, uint64_t now) {
     const size_t *o = s->layout.offsets;
@@ -294,6 +333,24 @@ static bool poll_cached_local(CfScene *s, CfSceneSnapshot *out, uint64_t now) {
         (camp != 1 && camp != 2))
         return false;
 
+    memset(out, 0, sizeof(*out));
+    out->time_ns = now;
+    out->local_id = pawn;
+    if (!poll_current_weapon(s, pawn, now)) return false;
+    out->current_weapon_sniper = s->cached_weapon_sniper;
+    if (!s->cached_weapon_sniper) return true;
+
+    uint8_t zooming = 0;
+    if (!read_at(s->cached_weapon, s->extra[WEAPON_ZOOMING], &zooming, 1)) {
+        s->cached_weapon = 0;
+        s->cached_weapon_sniper = false;
+        s->next_weapon_poll_ns = 0;
+        out->current_weapon_sniper = false;
+        return true;
+    }
+    out->sniper_zooming = zooming != 0;
+    if (!out->sniper_zooming) return true;
+
     uintptr_t camera = static_pointer(s, CAMERA);
     uintptr_t native_camera = pointer(camera, s->extra[CACHED]);
     float projection_y = 0, projection_after = 0;
@@ -302,10 +359,10 @@ static bool poll_cached_local(CfScene *s, CfSceneSnapshot *out, uint64_t now) {
         !isfinite(projection_y) || projection_y <= 0 || projection_y > 20.0f)
         return false;
 
-    uint8_t flags[3];
-    for (int j = 0; j < 3; ++j)
-        if (!read_at(controller, s->extra[ASSIST+j], &flags[j], 1))
-            return false;
+    uint8_t sniper_aim = 0, doing = 0;
+    if (!read_at(controller, s->extra[SNIPER], &sniper_aim, 1) ||
+        !read_at(controller, s->extra[DOING], &doing, 1))
+        return false;
     uintptr_t target = pointer(controller, s->extra[AIM_TARGET]);
 
     if (static_pointer(s, CAMERA) != camera ||
@@ -315,15 +372,10 @@ static bool poll_cached_local(CfScene *s, CfSceneSnapshot *out, uint64_t now) {
                  sizeof(projection_after)) || projection_after != projection_y)
         return false;
 
-    memset(out, 0, sizeof(*out));
-    out->time_ns = now;
-    out->local_id = pawn;
     out->projection_y = projection_y;
-    out->aim_enabled = flags[0] != 0;
-    out->sniper_aim_enabled = flags[1] != 0;
-    out->doing_aim_assist = flags[2] != 0;
+    out->sniper_aim_enabled = sniper_aim != 0;
+    out->doing_aim_assist = doing != 0;
     out->game_aim_target = target;
-    out->builtin_aim = flags[0] || flags[1] || flags[2];
     return true;
 }
 
@@ -394,14 +446,12 @@ static bool scene_read_full(CfScene *s, CfSceneSnapshot *out) {
                 uintptr_t game_class = pointer(local_game, 0);
                 if (!game_class) return false;
                 individual_mode = game_class == s->individual_game_class;
-                uint8_t flags[3];
-                for (int j = 0; j < 3; ++j)
-                    if (!read_at(ctrl, s->extra[ASSIST+j], &flags[j], 1)) return false;
-                out->aim_enabled = flags[0] != 0;
-                out->sniper_aim_enabled = flags[1] != 0;
-                out->doing_aim_assist = flags[2] != 0;
+                uint8_t sniper_aim = 0, doing = 0;
+                if (!read_at(ctrl, s->extra[SNIPER], &sniper_aim, 1) ||
+                    !read_at(ctrl, s->extra[DOING], &doing, 1)) return false;
+                out->sniper_aim_enabled = sniper_aim != 0;
+                out->doing_aim_assist = doing != 0;
                 out->game_aim_target = pointer(ctrl, s->extra[AIM_TARGET]);
-                out->builtin_aim = flags[0] || flags[1] || flags[2];
             }
         }
         CfVec3 root, upper, point;
@@ -545,8 +595,8 @@ static bool scene_read_current_target(CfScene *s, CfSceneSnapshot *out,
         return true;
     }
     if (final_hint.projection_y != projection[5]) return false;
-    out->builtin_aim = final_hint.builtin_aim;
-    out->aim_enabled = final_hint.aim_enabled;
+    out->current_weapon_sniper = final_hint.current_weapon_sniper;
+    out->sniper_zooming = final_hint.sniper_zooming;
     out->sniper_aim_enabled = final_hint.sniper_aim_enabled;
     out->doing_aim_assist = final_hint.doing_aim_assist;
     out->game_aim_target = final_hint.game_aim_target;
