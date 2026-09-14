@@ -1,0 +1,14 @@
+/build/
+/output/
+/backups/
+/backup_TB375FC_slot_a_*/
+/susfs_flash_stage_*/
+/dump.cs
+/external/gyro_probe/
+/tools/downloads/
+/tools/test-venv/
+__pycache__/
+*.py[cod]
+*.log
+.idea/
+.vs/

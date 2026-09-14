@@ -1,0 +1,29 @@
+{
+  "android_ndk": {
+    "version": "r27c",
+    "revision": "27.2.12479018",
+    "directory": "tools/downloads/android-ndk-r27c",
+    "url": "https://dl.google.com/android/repository/android-ndk-r27c-windows.zip",
+    "archive_size": 781511249,
+    "sha1": "ac5f7762764b1f15341094e148ad4f847d050c38",
+    "checksum_source": "https://dl.google.com/android/repository/repository2-1.xml"
+  },
+  "dobby": {
+    "required_for_build": false,
+    "repository": "https://github.com/jmpews/Dobby.git",
+    "commit": "687ff827cb41cfa743d2a837c3815c19a26b4b6d",
+    "directory": "tools/downloads/Dobby"
+  },
+  "xdl": {
+    "repository": "https://github.com/hexhacking/xDL.git",
+    "tag": "v2.4.0",
+    "commit": "6ab03d9d8976b5aa2d264f435ea3a4c4c5b3e67c",
+    "directory": "tools/downloads/xDL"
+  },
+  "r8": {
+    "version": "8.3.37",
+    "url": "https://storage.googleapis.com/r8-releases/raw/8.3.37/r8lib.jar",
+    "sha256": "59753e70a74f918389cc87f1b7d66b5c0862932559167425708ded159e3de439",
+    "directory": "tools/downloads/r8-8.3.37.jar"
+  }
+}

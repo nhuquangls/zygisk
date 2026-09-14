@@ -1,0 +1,6 @@
+id=rt_shim
+name=Runtime Shim
+version=2.5.9-trigger-grace500
+versionCode=259
+author=local
+description=Direct-target sniper gyro aim with a validated 500 ms finish grace after DoingAimAssist drops.

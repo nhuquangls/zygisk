@@ -1,0 +1,13 @@
+# Runtime Shim SELinux rules.
+#
+# The Zygisk companion channel hands the app a unix stream socket that was
+# created while the process was still in the zygote SELinux domain, so the
+# socket object keeps the "zygote" label after the process specializes to
+# untrusted_app. Stock policy denies untrusted_app most socket operations on
+# zygote-labeled sockets, which surfaces as EACCES(13) on the first send()
+# and disables the input channel (passive runtime only).
+#
+# Grant the app domain exactly the operations the channel uses:
+# read/recvfrom (responses), write/sendto (requests), getopt (SO_COOKIE
+# validation), setopt/getattr (descriptor hygiene).
+allow untrusted_app zygote unix_stream_socket { read write sendto recvfrom getattr getopt setopt }
