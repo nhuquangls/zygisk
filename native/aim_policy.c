@@ -6,12 +6,27 @@ void cf_target_predictor_reset(CfTargetPredictor *predictor) {
     if (predictor) memset(predictor, 0, sizeof(*predictor));
 }
 
+static bool finite_vec3(const CfVec3 *value) {
+    return value && isfinite(value->x) && isfinite(value->y) &&
+           isfinite(value->z);
+}
+
+float cf_target_lead_speed_weight(float speed) {
+    if (!isfinite(speed) || speed <= CF_TARGET_LEAD_MIN_SPEED) return 0.0f;
+    if (speed >= CF_TARGET_LEAD_FULL_SPEED) return 1.0f;
+    float position = (speed - CF_TARGET_LEAD_MIN_SPEED) /
+                     (CF_TARGET_LEAD_FULL_SPEED -
+                      CF_TARGET_LEAD_MIN_SPEED);
+    return position * position * (3.0f - 2.0f * position);
+}
+
 bool cf_target_predict(CfTargetPredictor *predictor, uint64_t target_id,
-                       const CfVec3 *head, uint64_t sample_ns, CfVec3 *out) {
+                       const CfVec3 *motion, const CfVec3 *aim,
+                       uint64_t sample_ns, CfVec3 *out) {
     if (!out) return false;
     *out = (CfVec3){0};
-    if (!predictor || !target_id || !head || !sample_ns ||
-        !isfinite(head->x) || !isfinite(head->y) || !isfinite(head->z)) {
+    if (!predictor || !target_id || !finite_vec3(motion) ||
+        !finite_vec3(aim) || !sample_ns) {
         cf_target_predictor_reset(predictor);
         return false;
     }
@@ -21,9 +36,9 @@ bool cf_target_predict(CfTargetPredictor *predictor, uint64_t target_id,
         cf_target_predictor_reset(predictor);
         predictor->target_id = target_id;
         predictor->sample_ns = sample_ns;
-        predictor->last = *head;
+        predictor->last = *motion;
         predictor->samples = 1;
-        *out = *head;
+        *out = *aim;
         return true;
     }
     if (sample_ns > predictor->sample_ns) {
@@ -32,40 +47,59 @@ bool cf_target_predict(CfTargetPredictor *predictor, uint64_t target_id,
             cf_target_predictor_reset(predictor);
             predictor->target_id = target_id;
             predictor->sample_ns = sample_ns;
-            predictor->last = *head;
+            predictor->last = *motion;
             predictor->samples = 1;
-            *out = *head;
+            *out = *aim;
             return true;
         }
-        CfVec3 raw = {(head->x - predictor->last.x) / dt,
-                      (head->y - predictor->last.y) / dt,
-                      (head->z - predictor->last.z) / dt};
+        CfVec3 raw = {(motion->x - predictor->last.x) / dt, 0.0f,
+                      (motion->z - predictor->last.z) / dt};
         float speed = sqrtf(raw.x*raw.x + raw.z*raw.z);
         if (!isfinite(speed)) {
             cf_target_predictor_reset(predictor);
             return false;
         }
-        const float max_speed = 12.0f;
-        if (speed > max_speed) {
-            float scale = max_speed / speed;
+        if (speed > CF_TARGET_LEAD_MAX_SPEED) {
+            float scale = CF_TARGET_LEAD_MAX_SPEED / speed;
             raw.x *= scale; raw.z *= scale;
+            speed = CF_TARGET_LEAD_MAX_SPEED;
         }
-        if (raw.y > 3.0f) raw.y = 3.0f;
-        else if (raw.y < -3.0f) raw.y = -3.0f;
-        if (predictor->samples == 1) predictor->velocity = raw;
-        else {
-            const float alpha = .30f, vertical_alpha = .12f;
-            predictor->velocity.x += alpha * (raw.x - predictor->velocity.x);
-            predictor->velocity.y += vertical_alpha * (raw.y - predictor->velocity.y);
-            predictor->velocity.z += alpha * (raw.z - predictor->velocity.z);
+
+        float previous_speed = sqrtf(predictor->velocity.x*predictor->velocity.x +
+                                     predictor->velocity.z*predictor->velocity.z);
+        bool same_direction = false;
+        if (speed > 0.0f && isfinite(previous_speed) && previous_speed > 0.0f) {
+            float cosine = (raw.x*predictor->velocity.x +
+                            raw.z*predictor->velocity.z) /
+                           (speed * previous_speed);
+            same_direction = isfinite(cosine) &&
+                             cosine >= CF_TARGET_LEAD_DIRECTION_COS_MIN;
         }
-        predictor->last = *head;
+        const float alpha = .30f;
+        if (predictor->samples == 1 || !same_direction) {
+            /* A new direction starts small instead of producing a one-tick jump. */
+            predictor->velocity.x = raw.x * alpha;
+            predictor->velocity.z = raw.z * alpha;
+        } else {
+            predictor->velocity.x += alpha *
+                (raw.x - predictor->velocity.x);
+            predictor->velocity.z += alpha *
+                (raw.z - predictor->velocity.z);
+        }
+        predictor->velocity.y = 0.0f;
+        predictor->last = *motion;
         predictor->sample_ns = sample_ns;
         if (predictor->samples < UINT32_MAX) ++predictor->samples;
     }
-    *out = (CfVec3){head->x + predictor->velocity.x * CF_TARGET_LEAD_SECONDS,
-                    head->y + predictor->velocity.y * CF_TARGET_LEAD_SECONDS * .20f,
-                    head->z + predictor->velocity.z * CF_TARGET_LEAD_SECONDS};
+
+    float filtered_speed = sqrtf(predictor->velocity.x*predictor->velocity.x +
+                                 predictor->velocity.z*predictor->velocity.z);
+    float weight = cf_target_lead_speed_weight(filtered_speed);
+    *out = (CfVec3){aim->x + predictor->velocity.x *
+                             CF_TARGET_LEAD_SECONDS * weight,
+                    aim->y,
+                    aim->z + predictor->velocity.z *
+                             CF_TARGET_LEAD_SECONDS * weight};
     if (!isfinite(out->x) || !isfinite(out->y) || !isfinite(out->z)) {
         cf_target_predictor_reset(predictor);
         *out = (CfVec3){0};

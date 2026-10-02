@@ -2,20 +2,43 @@
 #include <math.h>
 #include <string.h>
 
-static float clamp_rate(float value) {
-    if (value > CF_GYRO_RATE_CAP) return CF_GYRO_RATE_CAP;
-    if (value < -CF_GYRO_RATE_CAP) return -CF_GYRO_RATE_CAP;
+static float clamp_rate(float value, float cap) {
+    if (value > cap) return cap;
+    if (value < -cap) return -cap;
     return value;
+}
+
+static float rate_cap_for_distance(float distance) {
+    if (distance <= CF_GYRO_RATE_RAMP_START_PX)
+        return CF_GYRO_RATE_CAP_NEAR;
+    if (distance >= CF_GYRO_RATE_RAMP_END_PX)
+        return CF_GYRO_RATE_CAP_FAR;
+    float position = (distance - CF_GYRO_RATE_RAMP_START_PX) /
+                     (CF_GYRO_RATE_RAMP_END_PX -
+                      CF_GYRO_RATE_RAMP_START_PX);
+    /* Ease the cap at both ends so deceleration toward the target has no
+     * linear-curve corner at either distance threshold. */
+    position = position * position * (3.0f - 2.0f * position);
+    return CF_GYRO_RATE_CAP_NEAR +
+           position * (CF_GYRO_RATE_CAP_FAR - CF_GYRO_RATE_CAP_NEAR);
 }
 
 static void clear_lock(CfGyroController *controller) {
     controller->locked_target = 0;
     controller->last_seen_ns = 0;
     controller->lock_started_ns = 0;
-    controller->filtered_x = 0;
-    controller->filtered_y = 0;
     controller->settled = false;
     cf_target_predictor_reset(&controller->predictor);
+}
+
+static void start_lock(CfGyroController *controller, uint64_t target,
+                       uint64_t now, bool preserve_prediction) {
+    CfTargetPredictor predictor = controller->predictor;
+    clear_lock(controller);
+    if (preserve_prediction) controller->predictor = predictor;
+    controller->locked_target = target;
+    controller->lock_started_ns = now;
+    controller->trigger_armed = false;
 }
 
 void cf_gyro_controller_reset(CfGyroController *controller) {
@@ -69,13 +92,16 @@ bool cf_gyro_controller_step(CfGyroController *controller,
             return false;
         }
     } else {
+        bool resume_prediction = controller->trigger_armed &&
+            controller->locked_target == snapshot->game_aim_target &&
+            controller->trigger_lost_ns && now >= controller->trigger_lost_ns &&
+            now - controller->trigger_lost_ns <
+                CF_GYRO_TRIGGER_LOST_GRACE_NS;
         controller->trigger_lost_ns = 0;
         if (controller->trigger_armed ||
             snapshot->game_aim_target != controller->locked_target) {
-            clear_lock(controller);
-            controller->locked_target = snapshot->game_aim_target;
-            controller->lock_started_ns = now;
-            controller->trigger_armed = false;
+            start_lock(controller, snapshot->game_aim_target, now,
+                       resume_prediction);
         }
     }
 
@@ -89,8 +115,6 @@ bool cf_gyro_controller_step(CfGyroController *controller,
     if (controller->lock_started_ns &&
         now - controller->lock_started_ns > CF_GYRO_LOCK_TIMEOUT_NS) {
         controller->settled = true;
-        controller->filtered_x = 0;
-        controller->filtered_y = 0;
         out->mode = CF_GYRO_LATCHED;
         out->settled = true;
         return true;
@@ -99,8 +123,6 @@ bool cf_gyro_controller_step(CfGyroController *controller,
 
     const CfCandidate *candidate = find_target(snapshot, controller->locked_target);
     if (!candidate) {
-        controller->filtered_x = 0;
-        controller->filtered_y = 0;
         if (!controller->last_seen_ns ||
             now - controller->last_seen_ns > CF_GYRO_TARGET_GRACE_NS) {
             controller->settled = true;
@@ -110,18 +132,27 @@ bool cf_gyro_controller_step(CfGyroController *controller,
         return false;
     }
 
+    const CfVec3 *motion = snapshot->motion_target_id == candidate->id
+        ? &snapshot->motion_anchor : &candidate->head;
     CfVec3 predicted;
-    if (!cf_target_predict(&controller->predictor, candidate->id, &candidate->head,
-                           snapshot->time_ns, &predicted)) {
-        controller->filtered_x = 0;
-        controller->filtered_y = 0;
+    if (!cf_target_predict(&controller->predictor, candidate->id, motion,
+                           &candidate->head, snapshot->time_ns, &predicted)) {
         return false;
     }
-    CfVec2 screen;
-    if (!cf_world_to_screen(&snapshot->matrix, &predicted, viewport, &screen)) {
-        controller->filtered_x = 0;
-        controller->filtered_y = 0;
+    CfVec2 current_screen;
+    if (!cf_world_to_screen(&snapshot->matrix, &candidate->head, viewport,
+                            &current_screen)) {
         return false;
+    }
+    CfVec2 screen = current_screen, predicted_screen;
+    float applied_lead_pixels = 0.0f;
+    if (cf_world_to_screen(&snapshot->matrix, &predicted, viewport,
+                           &predicted_screen)) {
+        float lead_x = predicted_screen.x - current_screen.x;
+        float lead_y = predicted_screen.y - current_screen.y;
+        float lead_pixels = sqrtf(lead_x*lead_x + lead_y*lead_y);
+        screen = predicted_screen;
+        applied_lead_pixels = lead_pixels;
     }
     controller->last_seen_ns = now;
     out->active = true;
@@ -130,17 +161,14 @@ bool cf_gyro_controller_step(CfGyroController *controller,
     float distance = sqrtf(out->error_x*out->error_x + out->error_y*out->error_y);
     if (!isfinite(distance)) {
         controller->settled = true;
-        controller->filtered_x = 0;
-        controller->filtered_y = 0;
         out->mode = CF_GYRO_LATCHED;
         out->settled = true;
         return false;
     }
 
-    if (distance <= CF_GYRO_DEADBAND_PX) {
+    if (distance <= CF_GYRO_DEADBAND_PX &&
+        applied_lead_pixels < CF_TARGET_LEAD_FOLLOW_PIXELS) {
         controller->settled = true;
-        controller->filtered_x = 0;
-        controller->filtered_y = 0;
         out->active = false;
         out->mode = CF_GYRO_LATCHED;
         out->settled = true;
@@ -156,19 +184,16 @@ bool cf_gyro_controller_step(CfGyroController *controller,
     float denominator = viewport->height * .5f * snapshot->projection_y;
     if (!isfinite(denominator) || denominator <= 1.0f) {
         controller->settled = true;
-        controller->filtered_x = 0;
-        controller->filtered_y = 0;
         out->active = false;
         out->mode = CF_GYRO_LATCHED;
         out->settled = true;
         return false;
     }
-    float desired_x = clamp_rate(-CF_GYRO_KP * out->error_x / denominator);
-    float desired_y = clamp_rate( CF_GYRO_KP * out->error_y / denominator);
-    const float alpha = .25f;
-    controller->filtered_x += alpha * (desired_x - controller->filtered_x);
-    controller->filtered_y += alpha * (desired_y - controller->filtered_y);
-    out->sensor_x = controller->filtered_x;
-    out->sensor_y = controller->filtered_y;
+    float cap = rate_cap_for_distance(distance);
+    float desired_x = clamp_rate(-CF_GYRO_KP * out->error_x / denominator, cap);
+    float desired_y = clamp_rate( CF_GYRO_KP * out->error_y / denominator, cap);
+    /* Sensor-cadence slew limiting is applied after the real gyro read. */
+    out->sensor_x = desired_x;
+    out->sensor_y = desired_y;
     return true;
 }

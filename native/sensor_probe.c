@@ -1,11 +1,13 @@
 #define _GNU_SOURCE
 #include "sensor_probe.h"
+#include "gyro_ramp.h"
 #include "readonly_memory.h"
 #include <android/sensor.h>
 #include <elf.h>
 #include <errno.h>
 #include <math.h>
 #include <string.h>
+#include <time.h>
 #define MAX_DYNAMIC_BYTES (64u * 1024u)
 #define MAX_RELOCATIONS (1u << 20)
 
@@ -16,6 +18,16 @@ static uintptr_t g_original;
 static uint32_t g_adjust_active;
 static uint32_t g_adjust_x;
 static uint32_t g_adjust_y;
+static uint64_t g_adjust_published_ns;
+static uint32_t g_adjust_sequence;
+static _Thread_local CfGyroRamp g_ramp;
+
+typedef struct CfSensorCommand {
+    bool active;
+    float x;
+    float y;
+    uint64_t published_ns;
+} CfSensorCommand;
 
 static void set_error(char *out, size_t size, const char *text) {
     if (!out || size == 0) return;
@@ -37,6 +49,35 @@ static float bits_float(uint32_t bits) {
     float value;
     memcpy(&value, &bits, sizeof(value));
     return value;
+}
+
+static uint64_t boottime_ns(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_BOOTTIME, &now) != 0 || now.tv_sec < 0 ||
+        now.tv_nsec < 0 || now.tv_nsec >= 1000000000L) return 0;
+    return (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+}
+
+static bool load_command(CfSensorCommand *command) {
+    if (!command) return false;
+    memset(command, 0, sizeof(*command));
+    for (unsigned attempt = 0; attempt < 4; ++attempt) {
+        uint32_t before = __atomic_load_n(&g_adjust_sequence, __ATOMIC_ACQUIRE);
+        if (before & 1u) continue;
+        uint32_t active = __atomic_load_n(&g_adjust_active, __ATOMIC_RELAXED);
+        uint32_t x = __atomic_load_n(&g_adjust_x, __ATOMIC_RELAXED);
+        uint32_t y = __atomic_load_n(&g_adjust_y, __ATOMIC_RELAXED);
+        uint64_t published = __atomic_load_n(&g_adjust_published_ns,
+                                              __ATOMIC_RELAXED);
+        uint32_t after = __atomic_load_n(&g_adjust_sequence, __ATOMIC_ACQUIRE);
+        if (before != after || (after & 1u)) continue;
+        command->active = active != 0;
+        command->x = bits_float(x);
+        command->y = bits_float(y);
+        command->published_ns = published;
+        return true;
+    }
+    return false;
 }
 
 static bool module_contains(const CfModule *module, uintptr_t address, size_t size) {
@@ -84,14 +125,25 @@ static ssize_t sensor_get_events(ASensorEventQueue *queue, ASensorEvent *events,
     ssize_t received = ((GetEventsFn)original)(queue, events, count);
     if (received <= 0 || !events) return received;
 
-    bool adjust = __atomic_load_n(&g_adjust_active, __ATOMIC_ACQUIRE) != 0;
-    if (!adjust) return received;
-    float add_x = bits_float(__atomic_load_n(&g_adjust_x, __ATOMIC_RELAXED));
-    float add_y = bits_float(__atomic_load_n(&g_adjust_y, __ATOMIC_RELAXED));
+    CfSensorCommand command;
+    if (!load_command(&command) || !command.active) {
+        cf_gyro_ramp_reset(&g_ramp);
+        return received;
+    }
+    uint64_t now = boottime_ns();
+    if (!cf_gyro_command_fresh(true, command.published_ns, now)) {
+        cf_gyro_ramp_reset(&g_ramp);
+        return received;
+    }
+    const float target[2] = {command.x, command.y};
     for (ssize_t i = 0; i < received; ++i) {
         if (events[i].type != ASENSOR_TYPE_GYROSCOPE) continue;
-        events[i].data[0] += add_x;
-        events[i].data[1] += add_y;
+        float correction[2];
+        if (!cf_gyro_ramp_step(&g_ramp, true, target,
+                               (uint64_t)events[i].timestamp, correction))
+            continue;
+        events[i].data[0] += correction[0];
+        events[i].data[1] += correction[1];
     }
     return received;
 }
@@ -235,9 +287,17 @@ void cf_sensor_probe_set_adjustment(bool active, float x, float y) {
         x = 0;
         y = 0;
     }
+    uint64_t published = 0;
+    if (active) {
+        published = boottime_ns();
+        if (!published) active = false;
+    }
+    __atomic_fetch_add(&g_adjust_sequence, 1u, __ATOMIC_ACQ_REL);
     __atomic_store_n(&g_adjust_x, float_bits(active ? x : 0), __ATOMIC_RELAXED);
     __atomic_store_n(&g_adjust_y, float_bits(active ? y : 0), __ATOMIC_RELAXED);
-    __atomic_store_n(&g_adjust_active, active, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_adjust_published_ns, published, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_adjust_active, active, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_adjust_sequence, 1u, __ATOMIC_RELEASE);
 }
 
 void cf_sensor_probe_shutdown(void) {

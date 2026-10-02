@@ -2,12 +2,15 @@
 #define CF_GYRO_CONTROLLER_H
 #include "aim_policy.h"
 
-#define CF_GYRO_TRIGGER_LOST_GRACE_NS 500000000ULL
+#define CF_GYRO_TRIGGER_LOST_GRACE_NS 250000000ULL
 #define CF_GYRO_TARGET_GRACE_NS 200000000ULL
 #define CF_GYRO_LOCK_TIMEOUT_NS 2000000000ULL
 #define CF_GYRO_DEADBAND_PX 3.5f
-#define CF_GYRO_RATE_CAP 0.15f
-#define CF_GYRO_KP 5.5f
+#define CF_GYRO_RATE_CAP_NEAR 0.13f
+#define CF_GYRO_RATE_CAP_FAR 0.23f
+#define CF_GYRO_RATE_RAMP_START_PX 64.0f
+#define CF_GYRO_RATE_RAMP_END_PX 300.0f
+#define CF_GYRO_KP 7.0f
 
 enum CfGyroMode {
     CF_GYRO_IDLE = 0,
@@ -21,8 +24,6 @@ typedef struct CfGyroController {
     uint64_t last_seen_ns;
     uint64_t lock_started_ns;
     uint64_t trigger_lost_ns;
-    float filtered_x;
-    float filtered_y;
     bool settled;
     bool trigger_armed;
 } CfGyroController;

@@ -8,21 +8,19 @@
 #include <string.h>
 #include <time.h>
 
-enum Extra { UPPER, CAMP, SNIPER, DOING, AIM_TARGET, CACHED,
-             WEAPON_ZOOMING, EXTRA_COUNT };
+enum Extra { UPPER, SNIPER, DOING, AIM_TARGET, CACHED,
+             WEAPON_ZOOMING, CONTROLLER_SPECTATING, EXTRA_COUNT };
 enum Static { MANAGER, CAMERA, POSITION, FORWARD, FRAME, STATIC_COUNT };
+enum InstanceRole { ROLE_PAWN = 1, ROLE_CONTROLLER = 2, ROLE_LOCAL_PLAYER = 8 };
 typedef uintptr_t (*GetCurrentWeaponFn)(uintptr_t, const void *);
 struct CfScene {
     MetadataApi api;
     CfMetadataLayout layout;
-    void *attached, *pawn_class, *controller_class;
-    uintptr_t individual_game_class;
+    void *attached, *pawn_class, *controller_class, *local_player_class;
     bool (*assignable)(void *, void *);
     size_t extra[EXTRA_COUNT], list_offsets[3];
     uintptr_t list_class;
     void *statics[STATIC_COUNT];
-    struct { uintptr_t klass; unsigned roles; } allowed[32];
-    size_t allowed_count;
     uintptr_t cached_pawn, cached_controller, cached_local_player;
     uintptr_t cached_weapon;
     void *sniper_weapon_class;
@@ -30,11 +28,6 @@ struct CfScene {
     uint64_t next_bind_ns, next_weapon_poll_ns;
     bool cached_weapon_sniper;
 };
-bool cf_scene_candidate_is_enemy(bool individual_mode, int32_t camp,
-                                 int32_t local_camp, uintptr_t id,
-                                 uintptr_t local_id) {
-    return id != local_id && (individual_mode || camp != local_camp);
-}
 bool cf_scene_sniper_scope_active(const CfSceneSnapshot *snapshot) {
     return snapshot && snapshot->current_weapon_sniper &&
            snapshot->sniper_zooming && snapshot->sniper_aim_enabled &&
@@ -141,15 +134,15 @@ static bool offset(CfScene *s, void *klass, const char *name, int kind, size_t w
 CfScene *cf_scene_open(const CfModule *module, char *error, size_t size) {
     CfModule unity;
     if (!cf_find_module("libunity.so", &unity) ||
-        strcmp(unity.build_id, "1a60ff52f7bb4ad5de0465b12a83aba3d7af0700") != 0 ||
-        strcmp(module->build_id, "a8793b51fee671e98de0cc0ad42bb85ffd5d0677") != 0) {
+        strcmp(unity.build_id, "1304f8f523fbba8d98ab8d775ae4e3d696efdb04") != 0 ||
+        strcmp(module->build_id, "33384ad3538f357d057987fa88c9f4eba485e563") != 0) {
         snprintf(error, size, "unsupported Unity/IL2CPP build ID");
         return NULL;
     }
     // Verified on the pinned IL2CPP build: the thread-registration routine
     // called by thread_attach aborts while this runtime readiness flag is zero.
     // A published assembly list alone is insufficient during cold startup.
-    const uintptr_t registration_rva = 0xbe000e0;
+    const uintptr_t registration_rva = 0xc698140;
     uint32_t registration_ready = 0;
     if (module->load_bias > UINTPTR_MAX - registration_rva ||
         !cf_read_self(module->load_bias + registration_rva, &registration_ready,
@@ -181,12 +174,12 @@ CfScene *cf_scene_open(const CfModule *module, char *error, size_t size) {
     if (!game || !unity_image) goto fail;
     struct { const char *ns, *cl, *field; int kind; size_t width; } specs[] = {
         {"WNEngine", "Pawn", "m_CachedUpperBodyTransform", 18, 8},
-        {"WNEngine", "PlayerInfo", "m_Camp", 17, 4},
         {"WNEngine", "PlayerController", "m_EnableAimAssistanceForSniper", 2, 1},
         {"WNEngine", "PlayerController", "m_DoingAimAssist", 2, 1},
         {"WNEngine", "PlayerController", "m_CurrentAimAssistTarget", 18, 8},
         {"UnityEngine", "Object", "m_CachedPtr", 24, 8},
         {"WNGameBase", "WNWeaponSniper", "m_IsZooming", 2, 1},
+        {"WNEngine", "PlayerController", "m_IsSpectating", 2, 1},
     };
     for (size_t i = 0; i < EXTRA_COUNT; ++i) {
         void *cl = s->api.class_from_name(i == CACHED ? unity_image : game, specs[i].ns, specs[i].cl);
@@ -197,9 +190,10 @@ CfScene *cf_scene_open(const CfModule *module, char *error, size_t size) {
     }
     s->pawn_class = s->api.class_from_name(game, "WNGameBase", "WNPawn");
     s->controller_class = s->api.class_from_name(game, "WNEngine", "PlayerController");
+    s->local_player_class = s->api.class_from_name(game, "WNEngine", "LocalPlayer");
     s->sniper_weapon_class = s->api.class_from_name(
         game, "WNGameBase", "WNWeaponSniper");
-    const uintptr_t get_current_weapon_rva = 0x6876c98;
+    const uintptr_t get_current_weapon_rva = 0x416ae50;
     if (module->load_bias > UINTPTR_MAX - get_current_weapon_rva ||
         module->load_bias + get_current_weapon_rva < module->image_begin ||
         module->load_bias + get_current_weapon_rva >= module->image_end)
@@ -214,43 +208,11 @@ CfScene *cf_scene_open(const CfModule *module, char *error, size_t size) {
         s->statics[i] = get_field(s, i == MANAGER ? mc : cc, names[i], kinds[i], true);
         if (!s->statics[i]) { snprintf(error, size, "invalid static %s", names[i]); goto fail; }
     }
-    if (!s->pawn_class || !s->controller_class || !s->sniper_weapon_class)
+    if (!s->pawn_class || !s->controller_class || !s->local_player_class ||
+        !s->sniper_weapon_class)
         goto fail;
     void *(*from_type)(void *) = (void *(*)(void *))cf_exports_function(&ex, "il2cpp_class_from_type");
     if (!from_type) { snprintf(error, size, "missing il2cpp_class_from_type"); goto fail; }
-    void *info_class = s->api.class_from_name(game, "WNEngine", "PlayerInfo");
-    void *lp_class = s->api.class_from_name(game, "WNEngine", "LocalPlayer");
-    s->individual_game_class = (uintptr_t)s->api.class_from_name(
-        game, "WNIndivdualGame", "IndivdualGame");
-    if (!info_class || !lp_class || !s->individual_game_class) goto fail;
-    // This IL2CPP exports no image_get_class/count. Resolve the class names seen
-    // in live metadata; unknown subclasses are skipped without dereferencing a
-    // possibly raced object header inside an IL2CPP API.
-    const char *known[][2] = {
-        {"WNGameBase", "WNPawn"}, {"WNPVPGame", "PVPPlayerPawn"},
-        {"WNPVPGame.WNShootingTrainGame", "ShootingTrainPlayerPawn"},
-        {"WNPVPGame.WNBombGame", "BombGamePlayerPawn"},
-        {"WNEngine", "PlayerController"}, {"WNGameBase", "WNPlayerController"},
-        {"WNPVPGame", "PVPPlayerController"},
-        {"WNPVPGame.WNTeamGame", "TeamGamePlayerController"},
-        {"WNPVPGame.WNBombGame", "BombGamePlayerController"},
-        {"WNPVPGame.WNShootingTrainGame", "ShootingTrainPlayerController"},
-        {"WNEngine", "PlayerInfo"}, {"WNGameBase", "WNPlayerInfo"},
-        {"WNPVPGame", "PVPPlayerInfo"},
-        {"WNPVPGame.WNShootingTrainGame", "ShootingTrainPlayerInfo"},
-        {"WNEngine", "LocalPlayer"}
-    };
-    for (size_t i = 0; i < sizeof(known)/sizeof(known[0]); ++i) {
-        void *cl = s->api.class_from_name(game, known[i][0], known[i][1]);
-        if (!cl) continue;
-        unsigned roles = (s->assignable(s->pawn_class, cl) ? 1u : 0u) |
-                         (s->assignable(s->controller_class, cl) ? 2u : 0u) |
-                         (s->assignable(info_class, cl) ? 4u : 0u) |
-                         (s->assignable(lp_class, cl) ? 8u : 0u);
-        if (!roles) continue;
-        s->allowed[s->allowed_count].klass = (uintptr_t)cl;
-        s->allowed[s->allowed_count++].roles = roles;
-    }
     void *lf = get_field(s, mc, "m_AttackableTargetList", 21, false);
     void *lc = lf ? from_type(s->api.field_get_type(lf)) : NULL;
     if (!lc || !offset(s, lc, "_items", 29, 8, &s->list_offsets[0]) ||
@@ -278,11 +240,13 @@ static uintptr_t static_pointer(CfScene *s, int id) {
     return p;
 }
 static bool is_instance(CfScene *s, uintptr_t object, unsigned role) {
-    uintptr_t cl = pointer(object, 0);
-    if (!cl) return false;
-    for (size_t i = 0; i < s->allowed_count; ++i)
-        if (s->allowed[i].klass == cl) return !!(s->allowed[i].roles & role);
-    return false;
+    void *base = role == ROLE_PAWN ? s->pawn_class :
+                 role == ROLE_CONTROLLER ? s->controller_class :
+                 role == ROLE_LOCAL_PLAYER ? s->local_player_class : NULL;
+    uintptr_t before = pointer(object, 0);
+    if (!base || !before || !s->assignable(base, (void *)before)) return false;
+    /* Fail closed if the managed reference changed while its class was checked. */
+    return pointer(object, 0) == before;
 }
 #define CF_SCENE_REBIND_NS 5000000000ULL
 #define CF_WEAPON_POLL_NS 500000000ULL
@@ -310,32 +274,42 @@ static bool poll_current_weapon(CfScene *s, uintptr_t pawn, uint64_t now) {
 
 /*
  * The idle path deliberately reads only stable ownership links and the cached
- * current-weapon classification. Non-sniper sessions stop there and
- * are revisited at 500 ms. Once a sniper is cached, the 8 ms trigger path reads
- * its direct zoom flag, controller aim state and one projection coefficient.
- * It does not touch the attackable list, transforms or full camera matrices.
+ * current-weapon classification. Spectating is checked first and clears stale
+ * weapon state, so a dead local pawn cannot inherit aim from the viewed pawn;
+ * that state is revisited at 500 ms for the next round. Non-sniper sessions
+ * also stop at 500 ms. Once a sniper is cached, the 8 ms trigger path reads its
+ * direct zoom flag, controller aim state and one projection coefficient. It
+ * does not touch the attackable list, transforms or full camera matrices.
  */
 static bool poll_cached_local(CfScene *s, CfSceneSnapshot *out, uint64_t now) {
     const size_t *o = s->layout.offsets;
     uintptr_t pawn = s->cached_pawn;
     uintptr_t controller = s->cached_controller;
     uintptr_t local_player = s->cached_local_player;
-    if (!is_instance(s, pawn, 1) || !is_instance(s, controller, 2) ||
-        !is_instance(s, local_player, 8) ||
+    if (!is_instance(s, pawn, ROLE_PAWN) ||
+        !is_instance(s, controller, ROLE_CONTROLLER) ||
+        !is_instance(s, local_player, ROLE_LOCAL_PLAYER) ||
         pointer(pawn, o[CF_PAWN_CONTROLLER]) != controller ||
         pointer(controller, o[CF_CONTROLLER_PAWN]) != pawn ||
         pointer(controller, o[CF_CONTROLLER_LOCAL_PLAYER]) != local_player ||
         pointer(local_player, o[CF_LOCAL_PLAYER_CONTROLLER]) != controller)
         return false;
 
-    int32_t camp = 0;
-    if (!read_at(local_player, o[CF_LOCAL_PLAYER_CAMP], &camp, sizeof(camp)) ||
-        (camp != 1 && camp != 2))
-        return false;
-
     memset(out, 0, sizeof(*out));
     out->time_ns = now;
     out->local_id = pawn;
+
+    uint8_t spectating = 0;
+    if (!read_at(controller, s->extra[CONTROLLER_SPECTATING],
+                 &spectating, sizeof(spectating)))
+        return false;
+    if (spectating) {
+        s->cached_weapon = 0;
+        s->cached_weapon_sniper = false;
+        s->next_weapon_poll_ns = 0;
+        return true;
+    }
+
     if (!poll_current_weapon(s, pawn, now)) return false;
     out->current_weapon_sniper = s->cached_weapon_sniper;
     if (!s->cached_weapon_sniper) return true;
@@ -417,41 +391,42 @@ static bool scene_read_full(CfScene *s, CfSceneSnapshot *out) {
         for (int k = 0; k < 4; ++k) sum += projection[k*4+r]*view[c*4+k];
         out->matrix.m[r*4+c] = sum;
     }
-    int32_t camps[256], local_camp = 0;
+    CfVec3 roots[256];
     uintptr_t local_game = 0, local_controller = 0, local_player = 0;
-    bool individual_mode = false;
     for (int32_t i = 0; i < count; ++i) {
         uintptr_t obj = objects[i];
         uint8_t destroyed, hidden;
         float health;
-        int32_t camp;
-        if (!is_instance(s, obj, 1) || !read_at(obj, o[CF_COMPONENT_DESTROYED], &destroyed, 1) || destroyed) continue;
-        uintptr_t info = pointer(obj, o[CF_PAWN_PLAYER_INFO]);
-        if (!is_instance(s, info, 4)) continue;
-        if (!read_at(info, s->extra[CAMP], &camp, 4) || (camp != 1 && camp != 2) ||
-            !read_at(obj, o[CF_TARGET_HEALTH], &health, 4) || !isfinite(health) || health <= 0 ||
+        if (!is_instance(s, obj, ROLE_PAWN) ||
+            !read_at(obj, o[CF_COMPONENT_DESTROYED], &destroyed, 1) ||
+            destroyed ||
+            !read_at(obj, o[CF_TARGET_HEALTH], &health, 4) ||
+            !isfinite(health) || health <= 0 ||
             !read_at(obj, o[CF_TARGET_HIDDEN], &hidden, 1)) continue;
         uintptr_t ctrl = pointer(obj, o[CF_PAWN_CONTROLLER]);
-        if (ctrl && is_instance(s, ctrl, 2) && pointer(ctrl, o[CF_CONTROLLER_PAWN]) == obj) {
+        if (ctrl && is_instance(s, ctrl, ROLE_CONTROLLER) &&
+            pointer(ctrl, o[CF_CONTROLLER_PAWN]) == obj) {
             uintptr_t lp = pointer(ctrl, o[CF_CONTROLLER_LOCAL_PLAYER]);
-            int32_t lc;
-            if (lp && is_instance(s, lp, 8) && pointer(lp, o[CF_LOCAL_PLAYER_CONTROLLER]) == ctrl &&
-                read_at(lp, o[CF_LOCAL_PLAYER_CAMP], &lc, 4) && lc == camp) {
+            if (lp && is_instance(s, lp, ROLE_LOCAL_PLAYER) &&
+                pointer(lp, o[CF_LOCAL_PLAYER_CONTROLLER]) == ctrl) {
                 if (out->local_id && out->local_id != obj) return false;
                 out->local_id = obj;
-                local_camp = camp;
                 local_controller = ctrl;
                 local_player = lp;
                 local_game = pointer(obj, o[CF_COMPONENT_GAME]);
-                uintptr_t game_class = pointer(local_game, 0);
-                if (!game_class) return false;
-                individual_mode = game_class == s->individual_game_class;
-                uint8_t sniper_aim = 0, doing = 0;
-                if (!read_at(ctrl, s->extra[SNIPER], &sniper_aim, 1) ||
-                    !read_at(ctrl, s->extra[DOING], &doing, 1)) return false;
-                out->sniper_aim_enabled = sniper_aim != 0;
-                out->doing_aim_assist = doing != 0;
-                out->game_aim_target = pointer(ctrl, s->extra[AIM_TARGET]);
+                if (!pointer(local_game, 0)) return false;
+                uint8_t spectating = 0;
+                if (!read_at(ctrl, s->extra[CONTROLLER_SPECTATING],
+                             &spectating, sizeof(spectating)))
+                    return false;
+                if (!spectating) {
+                    uint8_t sniper_aim = 0, doing = 0;
+                    if (!read_at(ctrl, s->extra[SNIPER], &sniper_aim, 1) ||
+                        !read_at(ctrl, s->extra[DOING], &doing, 1)) return false;
+                    out->sniper_aim_enabled = sniper_aim != 0;
+                    out->doing_aim_assist = doing != 0;
+                    out->game_aim_target = pointer(ctrl, s->extra[AIM_TARGET]);
+                }
             }
         }
         CfVec3 root, upper, point;
@@ -461,14 +436,17 @@ static bool scene_read_full(CfScene *s, CfSceneSnapshot *out) {
         // UpperBody sits near the shoulder/neck and bobs with animation. Blend
         // from the pawn root to 78% of that span for a stable mid-chest point.
         if (!cf_chest_point(&root, &upper, &point)) continue;
-        camps[out->count] = camp;
+        roots[out->count] = root;
         out->candidates[out->count++] = (CfCandidate){obj, point, false, true, true, false};
     }
     if (!out->local_id) return false;
-    for (size_t i = 0; i < out->count; ++i)
-        out->candidates[i].enemy = cf_scene_candidate_is_enemy(
-            individual_mode, camps[i], local_camp,
-            out->candidates[i].id, out->local_id);
+    for (size_t i = 0; i < out->count; ++i) {
+        out->candidates[i].enemy = out->candidates[i].id != out->local_id;
+        if (out->candidates[i].id == out->game_aim_target) {
+            out->motion_target_id = out->candidates[i].id;
+            out->motion_anchor = roots[i];
+        }
+    }
     int32_t frame_after, count_after, version_after;
     s->api.field_static_get_value(s->statics[FRAME], &frame_after);
     if (frame_after != out->frame || static_pointer(s, CAMERA) != camera || static_pointer(s, MANAGER) != manager ||
@@ -512,7 +490,7 @@ static bool scene_read_current_target(CfScene *s, CfSceneSnapshot *out,
     bool game_trigger = out->doing_aim_assist && out->game_aim_target;
     uintptr_t target = game_trigger ? out->game_aim_target : retained_target;
     if (!target) return true;
-    if (target == out->local_id || !is_instance(s, target, 1)) {
+    if (target == out->local_id || !is_instance(s, target, ROLE_PAWN)) {
         suppress_active_target(out);
         return true;
     }
@@ -602,6 +580,8 @@ static bool scene_read_current_target(CfScene *s, CfSceneSnapshot *out,
     out->game_aim_target = final_hint.game_aim_target;
     out->candidates[0] = (CfCandidate){target, point, true, true, true, false};
     out->count = 1;
+    out->motion_target_id = target;
+    out->motion_anchor = root;
     out->time_ns = started;
 
     uint64_t finished = cf_monotonic_ns();

@@ -21,6 +21,9 @@ typedef struct CfSceneSnapshot {
     bool sniper_aim_enabled;
     bool doing_aim_assist;
     uintptr_t game_aim_target;
+    /* Root transform used only to estimate movement of the direct game target. */
+    uintptr_t motion_target_id;
+    CfVec3 motion_anchor;
 } CfSceneSnapshot;
 CfScene *cf_scene_open(const CfModule *, char *, size_t);
 void cf_scene_close(CfScene *);
@@ -32,6 +35,5 @@ bool cf_scene_needs_targets(const CfSceneSnapshot *, bool, bool, uintptr_t);
 uint32_t cf_scene_poll_interval_us(const CfSceneSnapshot *);
 bool cf_transform_position(uintptr_t, size_t, CfVec3 *);
 bool cf_chest_point(const CfVec3 *, const CfVec3 *, CfVec3 *);
-bool cf_scene_candidate_is_enemy(bool, int32_t, int32_t, uintptr_t, uintptr_t);
 uint64_t cf_monotonic_ns(void);
 #endif

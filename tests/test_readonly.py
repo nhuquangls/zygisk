@@ -16,6 +16,9 @@ MATRIX, POINT, VIEW, RESULT = DATA, DATA + 128, DATA + 160, DATA + 192
 CANDIDATES, SETTINGS = DATA + 256, DATA + 8192
 ERRNO = DATA + 0xF100
 IDENTITY = [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.]
+SNAPSHOT_SIZE = 6296
+SNAPSHOT_MOTION_TARGET = 6272
+SNAPSHOT_MOTION_ANCHOR = 6280
 
 
 def dex_uleb(data, offset):
@@ -303,10 +306,10 @@ class MetadataTests(unittest.TestCase):
                     m.uc.reg_write(r.UC_ARM64_REG_PC, m.reg(30))
                 def module():
                     m.uc.mem_write(m.reg(1), struct.pack('<QQQ129s7x', TARGET,
-                        TARGET, TARGET+0xc000000, b'1a60ff52f7bb4ad5de0465b12a83aba3d7af0700'))
+                        TARGET, TARGET+0xc000000, b'1304f8f523fbba8d98ab8d775ae4e3d696efdb04'))
                     ret(1)
                 def read_ready():
-                    self.assertEqual(m.reg(0), TARGET+0xbe000e0)
+                    self.assertEqual(m.reg(0), TARGET+0xc698140)
                     self.assertEqual(m.reg(2), 4)
                     if ready is not None: m.write32(m.reg(1), ready)
                     ret(int(ready is not None))
@@ -314,7 +317,7 @@ class MetadataTests(unittest.TestCase):
                     resolved.append(True)
                     ret(0)
                 m.uc.mem_write(DATA, struct.pack('<QQQ129s7x', TARGET, TARGET,
-                    TARGET+0xc000000, b'a8793b51fee671e98de0cc0ad42bb85ffd5d0677'))
+                    TARGET+0xc000000, b'33384ad3538f357d057987fa88c9f4eba485e563'))
                 m.callbacks[m.addr('cf_find_module')] = module
                 m.callbacks[m.addr('cf_read_self')] = read_ready
                 m.callbacks[m.addr('cf_metadata_resolve')] = resolve
@@ -384,7 +387,7 @@ class AimPolicyTests(unittest.TestCase):
     def fixture(self, dx, dy=0, ident=42):
         m = machine()
         snap = DATA + 0x2000
-        m.uc.mem_write(snap, bytes(6272))
+        m.uc.mem_write(snap, bytes(SNAPSHOT_SIZE))
         m.uc.mem_write(snap, struct.pack('<16f', *IDENTITY))
         m.uc.mem_write(snap+64, struct.pack('<Q3f4?', ident, dx/500, -dy/400, 0, True, True, True, False))
         m.write64(snap+6208, 1)
@@ -459,19 +462,66 @@ class AimPolicyTests(unittest.TestCase):
         self.assertEqual(self.choose(m, snap, 42), 0)
         self.assertEqual(bytes(m.uc.mem_read(RESULT, 24)), bytes(24))
 
-    def test_world_velocity_prediction_filters_and_resets_on_target_change(self):
+    def test_slow_root_motion_uses_smooth_noise_gate_not_chest_noise(self):
         m = machine()
-        predictor, head, out = DATA+0x5000, DATA+0x5100, DATA+0x5200
+        predictor, motion = DATA+0x5000, DATA+0x5100
+        aim, out = DATA+0x5180, DATA+0x5200
         m.uc.mem_write(predictor, bytes(48))
-        m.uc.mem_write(head, struct.pack('<3f', 0, 0, 0))
-        self.assertEqual(m.call('cf_target_predict', predictor, 42, head, 1000000000, out), 1)
-        self.assertEqual(struct.unpack('<3f', m.uc.mem_read(out, 12)), (0, 0, 0))
-        m.uc.mem_write(head, struct.pack('<3f', .1, 0, 0))
-        self.assertEqual(m.call('cf_target_predict', predictor, 42, head, 1020000000, out), 1)
-        self.assertAlmostEqual(struct.unpack('<f', m.uc.mem_read(out, 4))[0], .55, places=4)
-        m.uc.mem_write(head, struct.pack('<3f', 2, 3, 4))
-        self.assertEqual(m.call('cf_target_predict', predictor, 43, head, 1040000000, out), 1)
-        self.assertEqual(struct.unpack('<3f', m.uc.mem_read(out, 12)), (2, 3, 4))
+        leads = []
+        for index in range(5):
+            m.uc.mem_write(motion, struct.pack('<3f', index * .01, 0, 0))
+            # Deliberately bob the chest independently from the root anchor.
+            m.uc.mem_write(aim, struct.pack('<3f', index * .01 + (-1)**index * .03,
+                                            1, 0))
+            self.assertEqual(m.call('cf_target_predict', predictor, 42, motion,
+                                    aim, 1000000000 + index * 20000000, out), 1)
+            predicted = struct.unpack('<3f', m.uc.mem_read(out, 12))
+            current = struct.unpack('<3f', m.uc.mem_read(aim, 12))
+            leads.append(predicted[0] - current[0])
+            self.assertAlmostEqual(predicted[1], current[1], places=6)
+        self.assertAlmostEqual(leads[0], 0., places=6)
+        self.assertAlmostEqual(leads[1], 0., places=6)
+        self.assertTrue(0. < leads[2] < leads[3] < leads[4])
+        self.assertLess(leads[-1], .004)
+
+    def test_fast_root_motion_ramps_from_first_velocity_sample(self):
+        m = machine()
+        predictor, motion = DATA+0x5000, DATA+0x5100
+        aim, out = DATA+0x5180, DATA+0x5200
+        m.uc.mem_write(predictor, bytes(48))
+        expected_leads = (0., .09, .153, .1971)
+        for index in range(4):
+            x = index * .1  # 5 m/s at 20 ms.
+            m.uc.mem_write(motion, struct.pack('<3f', x, 0, 0))
+            m.uc.mem_write(aim, struct.pack('<3f', x, 1, 0))
+            self.assertEqual(m.call('cf_target_predict', predictor, 42, motion,
+                                    aim, 1000000000 + index * 20000000, out), 1)
+            predicted = struct.unpack('<3f', m.uc.mem_read(out, 12))
+            self.assertAlmostEqual(predicted[0], x + expected_leads[index],
+                                   places=5)
+            self.assertAlmostEqual(predicted[1], 1., places=4)
+
+        m.uc.mem_write(motion, struct.pack('<3f', .2, 0, 0))
+        m.uc.mem_write(aim, struct.pack('<3f', .2, 1, 0))
+        self.assertEqual(m.call('cf_target_predict', predictor, 42, motion,
+                                aim, 1080000000, out), 1)
+        reversed_prediction = struct.unpack('<3f', m.uc.mem_read(out, 12))
+        self.assertAlmostEqual(reversed_prediction[0], .2 - .09, places=5)
+        self.assertAlmostEqual(reversed_prediction[1], 1., places=5)
+
+        m.uc.mem_write(motion, struct.pack('<3f', 2, 3, 4))
+        m.uc.mem_write(aim, struct.pack('<3f', 2, 4, 4))
+        self.assertEqual(m.call('cf_target_predict', predictor, 43, motion,
+                                aim, 1100000000, out), 1)
+        self.assertEqual(struct.unpack('<3f', m.uc.mem_read(out, 12)), (2, 4, 4))
+
+    def test_speed_weight_smoothly_rejects_only_low_speed_noise(self):
+        m = machine()
+        for speed, expected in ((0., 0.), (.25, 0.), (.525, .5),
+                                (.8, 1.), (3., 1.), (100., 1.)):
+            m.set_float_reg(speed)
+            m.call('cf_target_lead_speed_weight')
+            self.assertAlmostEqual(m.float_reg(), expected, places=5)
 
 
 class GyroControllerTests(unittest.TestCase):
@@ -481,7 +531,7 @@ class GyroControllerTests(unittest.TestCase):
     def fixture(self, dx=100, dy=50, projection=5.671282):
         m = machine()
         snap = DATA + 0x2000
-        m.uc.mem_write(snap, bytes(6272))
+        m.uc.mem_write(snap, bytes(SNAPSHOT_SIZE))
         m.uc.mem_write(snap, struct.pack('<16f', *IDENTITY))
         m.uc.mem_write(snap+64, struct.pack(
             '<Q3f4?', 42, dx/500, -dy/400, 0, True, True, True, False))
@@ -491,6 +541,9 @@ class GyroControllerTests(unittest.TestCase):
         m.write64(snap+6248, 99)
         m.uc.mem_write(snap+6256, b'\1\1\1\1')
         m.write64(snap+6264, 42)
+        m.write64(snap+SNAPSHOT_MOTION_TARGET, 42)
+        m.uc.mem_write(snap+SNAPSHOT_MOTION_ANCHOR,
+                       struct.pack('<3f', dx/500, -dy/400, 0))
         m.uc.mem_write(VIEW, struct.pack('<2f', 1000, 800))
         m.uc.mem_write(self.STATE, bytes(256))
         m.uc.mem_write(self.COMMAND, bytes(64))
@@ -518,8 +571,73 @@ class GyroControllerTests(unittest.TestCase):
         self.assertAlmostEqual(ey, 50, places=3)
         self.assertLess(sx, 0)
         self.assertGreater(sy, 0)
-        self.assertLessEqual(abs(sx), .15)
-        self.assertLessEqual(abs(sy), .15)
+        self.assertLessEqual(abs(sx), .230001)
+        self.assertLessEqual(abs(sy), .230001)
+
+    def test_far_error_uses_reduced_dynamic_cap(self):
+        m, snap = self.fixture(dx=400, dy=0)
+        self.assertEqual(self.step(m, snap), 1)
+        _, _, _, sx, sy, _, active, _ = self.command(m)
+        self.assertTrue(active)
+        self.assertAlmostEqual(sx, -.23, places=5)
+        self.assertAlmostEqual(sy, 0., places=5)
+
+    def test_near_error_remains_proportional_below_near_cap(self):
+        m, snap = self.fixture(dx=20, dy=0)
+        self.assertEqual(self.step(m, snap), 1)
+        _, _, _, sx, sy, _, active, _ = self.command(m)
+        expected = -7.0 * 20 / (400 * 5.671282)
+        self.assertTrue(active)
+        self.assertAlmostEqual(sx, expected, places=5)
+        self.assertAlmostEqual(sy, 0., places=5)
+        self.assertLess(abs(sx), .13)
+
+    def test_mid_distance_cap_uses_smoothstep_easing(self):
+        m, snap = self.fixture(dx=160, dy=0)
+        self.assertEqual(self.step(m, snap), 1)
+        _, _, _, sx, sy, _, active, _ = self.command(m)
+        position = (160.0 - 64.0) / (300.0 - 64.0)
+        eased = position * position * (3.0 - 2.0 * position)
+        expected = .13 + eased * (.23 - .13)
+        self.assertTrue(active)
+        self.assertAlmostEqual(sx, -expected, places=5)
+        self.assertAlmostEqual(sy, 0., places=5)
+
+    def test_slow_root_motion_adds_only_a_subpixel_continuous_lead(self):
+        m, snap = self.fixture(dx=100, dy=0)
+        self.assertEqual(self.step(m, snap), 1)
+        leads = []
+        for index in range(1, 5):
+            root_x = .2 + index * .004  # 0.5 m/s at 8 ms.
+            chest_x = root_x + (.02 if index & 1 else -.02)
+            now = 1000000000 + index * 8000000
+            m.uc.mem_write(snap+72, struct.pack('<3f', chest_x, 0, 0))
+            m.uc.mem_write(snap+SNAPSHOT_MOTION_ANCHOR,
+                           struct.pack('<3f', root_x, 0, 0))
+            m.write64(snap+6216, now)
+            self.assertEqual(self.step(m, snap, now), 1)
+            lead_pixels = self.command(m)[1] - chest_x * 500
+            leads.append(lead_pixels)
+        self.assertAlmostEqual(leads[0], 0., places=4)
+        self.assertTrue(0. < leads[1] < leads[2] < leads[3])
+        self.assertLess(leads[-1], 2.)
+
+    def test_fast_root_motion_builds_lead_continuously(self):
+        m, snap = self.fixture(dx=100, dy=0)
+        self.assertEqual(self.step(m, snap), 1)
+        for index in range(1, 4):
+            x = .2 + index * .04  # 5 m/s at 8 ms.
+            now = 1000000000 + index * 8000000
+            m.uc.mem_write(snap+72, struct.pack('<3f', x, 0, 0))
+            m.uc.mem_write(snap+SNAPSHOT_MOTION_ANCHOR,
+                           struct.pack('<3f', x, 0, 0))
+            m.write64(snap+6216, now)
+            self.assertEqual(self.step(m, snap, now), 1)
+        # EMA velocity is 3.285 m/s after three samples. Above the low-speed
+        # noise gate the fixed 60 ms horizon makes lead linear in velocity.
+        self.assertAlmostEqual(self.command(m)[1],
+                               (.32 + .1971) * 500,
+                               places=2)
 
     def test_trigger_is_idle_until_sniper_scope_is_open(self):
         m, snap = self.fixture()
@@ -527,7 +645,7 @@ class GyroControllerTests(unittest.TestCase):
         self.assertEqual(self.step(m, snap), 0)
         self.assertEqual(self.command(m), (0, 0, 0, 0, 0, 0, False, False))
 
-    def test_tracking_gets_exactly_500ms_after_game_trigger_drops(self):
+    def test_tracking_gets_exactly_250ms_after_game_trigger_drops(self):
         m, snap = self.fixture()
         self.assertEqual(self.step(m, snap), 1)
         m.uc.mem_write(snap+6259, b'\0')
@@ -535,12 +653,37 @@ class GyroControllerTests(unittest.TestCase):
         m.write64(snap+6216, 1016000000)
         self.assertEqual(self.step(m, snap, 1016000000), 1)
         self.assertEqual(self.command(m)[5:7], (2, True))
-        m.write64(snap+6216, 1515999999)
-        self.assertEqual(self.step(m, snap, 1515999999), 1)
+        m.write64(snap+6216, 1265999999)
+        self.assertEqual(self.step(m, snap, 1265999999), 1)
         self.assertEqual(self.command(m)[5:7], (2, True))
-        m.write64(snap+6216, 1516000000)
-        self.assertEqual(self.step(m, snap, 1516000000), 0)
+        m.write64(snap+6216, 1266000000)
+        self.assertEqual(self.step(m, snap, 1266000000), 0)
         self.assertEqual(self.command(m), (0, 0, 0, 0, 0, 0, False, False))
+
+    def test_brief_trigger_blink_preserves_predictor_velocity(self):
+        m, snap = self.fixture(dx=100, dy=0)
+        self.assertEqual(self.step(m, snap), 1)
+        for index, x in enumerate((.24, .28), start=1):
+            now = 1000000000 + index * 8000000
+            m.uc.mem_write(snap+72, struct.pack('<3f', x, 0, 0))
+            m.uc.mem_write(snap+SNAPSHOT_MOTION_ANCHOR,
+                           struct.pack('<3f', x, 0, 0))
+            m.write64(snap+6216, now)
+            if index == 2:
+                m.uc.mem_write(snap+6259, b'\0')
+                m.write64(snap+6264, 0)
+            self.assertEqual(self.step(m, snap, now), 1)
+        self.assertEqual(m.read32(self.STATE+40), 3)
+
+        m.uc.mem_write(snap+6259, b'\1')
+        m.write64(snap+6264, 42)
+        m.uc.mem_write(snap+72, struct.pack('<3f', .32, 0, 0))
+        m.uc.mem_write(snap+SNAPSHOT_MOTION_ANCHOR,
+                       struct.pack('<3f', .32, 0, 0))
+        m.write64(snap+6216, 1024000000)
+        self.assertEqual(self.step(m, snap, 1024000000), 1)
+        self.assertEqual(m.read32(self.STATE+40), 4)
+        self.assertGreater(self.command(m)[1], .32 * 500)
 
     def test_settled_cycle_rearms_on_next_game_trigger(self):
         m, snap = self.fixture(dx=2, dy=1)
@@ -620,19 +763,100 @@ class GyroControllerTests(unittest.TestCase):
         self.assertEqual(self.command(m)[5:], (3, False, True))
 
 
+class GyroRampTests(unittest.TestCase):
+    STATE = DATA + 0x7000
+    TARGET_RATE = DATA + 0x7100
+    OUTPUT_RATE = DATA + 0x7200
+
+    def setUp(self):
+        self.m = machine()
+        self.m.uc.mem_write(self.STATE, bytes(16))
+        self.m.uc.mem_write(self.TARGET_RATE, struct.pack('<2f', .15, -.15))
+        self.m.uc.mem_write(self.OUTPUT_RATE, bytes(8))
+
+    def step(self, timestamp, active=True):
+        result = self.m.call('cf_gyro_ramp_step', self.STATE, int(active),
+                             self.TARGET_RATE, timestamp, self.OUTPUT_RATE)
+        rates = struct.unpack('<2f', self.m.uc.mem_read(self.OUTPUT_RATE, 8))
+        return result, rates
+
+    def test_maximum_correction_ramps_over_four_400hz_samples(self):
+        start = 1000000000
+        expected = (.05, .10, .15, .15)
+        for index, value in enumerate(expected):
+            result, rates = self.step(start + index * 2500000)
+            self.assertEqual(result, 1)
+            self.assertAlmostEqual(rates[0], value, places=5)
+            self.assertAlmostEqual(rates[1], -value, places=5)
+
+    def test_direction_reversal_is_bounded_and_inactive_stops_immediately(self):
+        start = 1000000000
+        for index in range(4):
+            self.step(start + index * 2500000)
+        self.m.uc.mem_write(self.TARGET_RATE, struct.pack('<2f', -.15, .15))
+        previous = .15
+        for index in range(1, 9):
+            _, rates = self.step(start + (3 + index) * 2500000)
+            self.assertLessEqual(abs(rates[0] - previous), .050001)
+            previous = rates[0]
+        self.assertAlmostEqual(previous, -.15, places=5)
+        result, rates = self.step(start + 30000000, active=False)
+        self.assertEqual((result, rates), (0, (0., 0.)))
+        self.assertEqual(bytes(self.m.uc.mem_read(self.STATE, 16)), bytes(16))
+
+    def test_invalid_target_and_long_event_gap_reset_fail_closed(self):
+        start = 1000000000
+        self.step(start)
+        _, rates = self.step(start + 2500000)
+        self.assertAlmostEqual(rates[0], .10, places=5)
+        _, rates = self.step(start + 100000000)
+        self.assertAlmostEqual(rates[0], .05, places=5)
+        self.assertAlmostEqual(rates[1], -.05, places=5)
+        self.m.uc.mem_write(self.TARGET_RATE, struct.pack('<2f', math.nan, 0.))
+        self.assertEqual(self.step(start + 102500000), (0, (0., 0.)))
+
+    def test_command_timeout_boundary_is_exactly_100ms(self):
+        fresh = self.m.addr('cf_gyro_command_fresh')
+        self.assertTrue(fresh)
+        published = 1000000000
+        self.assertEqual(self.m.call('cf_gyro_command_fresh', 1, published,
+                                     published + 100000000), 1)
+        self.assertEqual(self.m.call('cf_gyro_command_fresh', 1, published,
+                                     published + 100000001), 0)
+        self.assertEqual(self.m.call('cf_gyro_command_fresh', 0, published,
+                                     published), 0)
+        self.assertEqual(self.m.call('cf_gyro_command_fresh', 1, 0,
+                                     published), 0)
+
+
 class SceneModePolicyTests(unittest.TestCase):
-    def test_team_modes_use_camp_but_individual_mode_uses_identity(self):
-        m = machine()
-        enemy = 'cf_scene_candidate_is_enemy'
-        self.assertEqual(m.call(enemy, 0, 1, 1, 42, 99), 0)
-        self.assertEqual(m.call(enemy, 0, 2, 1, 42, 99), 1)
-        self.assertEqual(m.call(enemy, 1, 1, 1, 42, 99), 1)
-        self.assertEqual(m.call(enemy, 1, 1, 1, 99, 99), 0)
+    def test_target_policy_is_mode_and_camp_independent(self):
+        source = (ROOT / 'native/scene_snapshot.c').read_text(encoding='utf-8')
+        self.assertNotIn('individual_game_class', source)
+        self.assertNotIn('extra[CAMP]', source)
+        self.assertNotIn('BombGamePlayerPawn', source)
+        self.assertNotIn('TeamGamePlayerController', source)
+        self.assertIn('out->candidates[i].id != out->local_id', source)
+        self.assertIn('s->assignable(base, (void *)before)', source)
+
+    def test_cached_local_blocks_spectating_before_weapon_poll(self):
+        source = (ROOT / 'native/scene_snapshot.c').read_text(encoding='utf-8')
+        self.assertIn('{"WNEngine", "PlayerController", "m_IsSpectating", 2, 1}',
+                      source)
+        start = source.index('static bool poll_cached_local')
+        end = source.index('static bool scene_read_full', start)
+        body = source[start:end]
+        spectator_read = body.index('extra[CONTROLLER_SPECTATING]')
+        weapon_poll = body.index('poll_current_weapon')
+        self.assertLess(spectator_read, weapon_poll)
+        self.assertIn('s->cached_weapon = 0;', body)
+        self.assertIn('s->cached_weapon_sniper = false;', body)
+        self.assertIn('s->next_weapon_poll_ns = 0;', body)
 
     def test_idle_gate_requests_full_targets_only_for_sniper_session(self):
         m = machine()
         snap = DATA + 0x2000
-        m.uc.mem_write(snap, bytes(6272))
+        m.uc.mem_write(snap, bytes(SNAPSHOT_SIZE))
         m.uc.mem_write(snap+6228, struct.pack('<f', 5.671282))
         m.uc.mem_write(snap+6256, b'\1\1\1\1')
         m.write64(snap+6264, 42)
@@ -653,7 +877,7 @@ class SceneModePolicyTests(unittest.TestCase):
     def test_poll_interval_follows_lobby_weapon_and_trigger_tiers(self):
         m = machine()
         snap = DATA + 0x2000
-        m.uc.mem_write(snap, bytes(6272))
+        m.uc.mem_write(snap, bytes(SNAPSHOT_SIZE))
         self.assertEqual(m.call('cf_scene_poll_interval_us', 0), 5000000)
         self.assertEqual(m.call('cf_scene_poll_interval_us', snap), 5000000)
         m.write64(snap+6248, 99)
@@ -1003,7 +1227,7 @@ class RuntimeTests(unittest.TestCase):
                     ret(1)
                 def poll_scene():
                     snap = m.reg(1)
-                    m.uc.mem_write(snap, bytes(6272))
+                    m.uc.mem_write(snap, bytes(SNAPSHOT_SIZE))
                     m.write64(snap+6216, 1000000000)
                     m.uc.mem_write(snap+6228, struct.pack(
                         '<f', 5.671282 if active else 1.25))
@@ -1057,17 +1281,16 @@ class RuntimeTests(unittest.TestCase):
             for tag in (b'SysLoader', b'SysRuntime', b'SysGyro'):
                 self.assertNotIn(tag, data, path.name)
 
-    def test_team_game_pvp_controller_profile_is_packaged(self):
+    def test_payload_uses_base_types_without_mode_specific_profiles(self):
         payload = (ROOT / 'build/readonly_native/libgcloudsync.so').read_bytes()
-        self.assertIn(b'WNPVPGame.WNTeamGame\0', payload)
-        self.assertIn(b'TeamGamePlayerController\0', payload)
-
-    def test_individual_and_bomb_game_profiles_are_packaged(self):
-        payload = (ROOT / 'build/readonly_native/libgcloudsync.so').read_bytes()
+        self.assertIn(b'WNPawn\0', payload)
+        self.assertIn(b'PlayerController\0', payload)
+        self.assertIn(b'LocalPlayer\0', payload)
         for value in [b'WNIndivdualGame\0', b'IndivdualGame\0',
                       b'WNPVPGame.WNBombGame\0', b'BombGamePlayerPawn\0',
-                      b'BombGamePlayerController\0']:
-            self.assertIn(value, payload)
+                      b'BombGamePlayerController\0', b'WNPVPGame.WNTeamGame\0',
+                      b'TeamGamePlayerController\0']:
+            self.assertNotIn(value, payload)
 
     def test_active_reader_uses_game_target_without_visible_or_list_scan(self):
         source = (ROOT / 'native/scene_snapshot.c').read_text(encoding='utf-8')
@@ -1137,6 +1360,7 @@ if __name__ == '__main__':
                     str(ROOT / 'native/il2cpp_metadata.c'),
                     str(ROOT / 'native/aim_math.c'), str(ROOT / 'native/aim_policy.c'),
                     str(ROOT / 'native/gyro_controller.c'),
+                    str(ROOT / 'native/gyro_ramp.c'),
                     str(ROOT / 'native/scene_snapshot.c'),
                     str(ROOT / 'loader/jni/input_companion.c'), '-ldl', '-o',
                     str(ROOT / 'build/readonly_native/libreadmath_test.so')], check=True)

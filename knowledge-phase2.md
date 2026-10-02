@@ -634,3 +634,164 @@ Bản đã cài và reboot trên `192.168.5.102:5555`; module active đúng
 payload `bdc742ce8832dcf7d2611ae3a21e0ea4a43c32b5b8effa6e41492f96cb769aec`
 khớp staging. Game PID 5620 nạp Unity/IL2CPP, file payload tạm đã được unlink,
 không còn tên module trong maps, PID ổn định và không có fatal/runtime log.
+
+### v2.8.0-adaptive-lead
+
+Giữ nguyên gate sniper gồm current weapon assignable từ `WNWeaponSniper`,
+`m_IsZooming`, `m_EnableAimAssistanceForSniper` và trigger
+`m_DoingAimAssist + m_CurrentAimAssistTarget`.
+
+Prediction chuyển sang đo vận tốc ngang từ root transform, không còn lấy chuyển
+động của điểm ngực pha root/upper-body làm vận tốc. Dưới `0.60 m/s` không lead;
+từ `0.60-1.80 m/s` nội suy mượt đến horizon tối đa 90 ms và chỉ mở sau ba mẫu
+cùng hướng. Khi đổi hướng hoặc giảm dưới ngưỡng, velocity cũ bị xóa ngay. Sau
+world prediction còn có gate screen-space: dưới 4 px bỏ qua, 4-12 px blend dần
+và từ 12 px dùng đầy đủ. Trục Y không prediction. Target có lead thực sự từ 1 px
+trở lên không latch ở deadband 3.5 px mà tiếp tục được cập nhật trong cycle.
+
+Scene binding bỏ whitelist class theo Team/Bomb/Individual/Training và bỏ camp
+khỏi quyết định target. Pawn, controller và local player được xác thực bằng
+assignability với base class cùng các liên kết hai chiều. Đường active tiếp tục
+đọc thẳng pawn do game chọn, kiểm tra khác local, destroyed/hidden/health,
+transform và target/trigger nhất quán; không quét hay tự chọn enemy trên tick
+8 ms.
+
+Build release đạt **69/69 test ARM64**; versionCode 280. ZIP SHA-256
+`396CADF18157FFAD58CA9AE43E57657ED9F7EF45B564973E41DDAAD799EDE0EC`.
+Bản đã cài và reboot trên `192.168.5.102:5555`; payload
+`60e7c3798734436c593cd0f487c60cbbc0ee69cfca7a02e64abcd4555677e40c`
+và loader `e25ae04142320432dc9570a31fba5353db3001f9ee83c32d4e3ef7861aacf8fe`
+khớp ZIP. Game PID 6162 nạp Unity/IL2CPP cùng anonymous executable payload
+0xc000 và crash buffer không có lỗi của game.
+
+### v2.8.1-continuous-lead (build-only)
+
+Prediction bỏ các vùng tốc độ `0.60/1.80 m/s`, gate ba mẫu và các vùng pixel
+`4/12 px`. Horizon dùng một đường liên tục duy nhất:
+`90 ms * clamp(filtered_speed / 12 m/s, 0, 1)`. Vận tốc vẫn đo từ root và chỉ
+dự đoán ngang. EMA alpha 0.30 khởi tạo một hướng mới ở 30% raw velocity rồi hội
+tụ dần; khi đổi hướng cũng bắt đầu nhỏ theo hướng mới thay vì giữ vector cũ hoặc
+nhảy toàn lực trong một tick. Ngưỡng follow 1 px chỉ dùng để quyết định settle,
+không chia mức prediction.
+
+Build release đạt **69/69 test ARM64**; versionCode 281. Theo yêu cầu, bản này
+chỉ được build thành `output/rt_shim.zip`, không push, không cài và không reboot
+thiết bị.
+
+## 13. Experimental hook_version — scope-open event
+
+Live tracing on 2026-09-19, PID 5142, confirmed three consecutive scope-open
+and scope-close cycles on the same `WNWeaponSniper` object. Every open called
+`set_IsZooming(true)`, changed `m_IsZooming` from false to true, then entered
+`T_OnZooming` in the same millisecond. Every close called
+`set_IsZooming(false)` and left the field false; two completed in the same
+millisecond and one completed after 18 ms.
+
+Disassembly for pinned IL2CPP build ID
+`a8793b51fee671e98de0cc0ad42bb85ffd5d0677` shows the open-only callsite at RVA
+`0x889b64c`: after reading `m_IsZooming` at offset `0x8e8`, the false path skips
+the call and the true path executes `BL WNWeaponSniper.T_OnZooming` (RVA
+`0x889b680`). The experimental build patches only this aligned 4-byte BL after
+validating its decoded destination, calls the original method, then increments
+an atomic generation and wakes the worker.
+
+`hook_version` therefore keeps the stable target/gyro logic but changes idle
+scheduling. Scope open wakes immediately and forces a current-weapon refresh;
+scope open continues at 8 ms, while scope closed sleeps indefinitely on the
+event with no lobby/current-weapon fallback poll. The method event alone grants
+a bounded 500 ms scene-acquisition window for transient Unity state. Closing
+scope is still detected by the direct `m_IsZooming` read on the next active tick
+(about 8 ms worst case), then the worker sleeps again.
+It builds separately with `build_zygisk.ps1 -HookVersion` as
+`output/rt_shim_hook_version.zip`; the normal build remains patch-free.
+
+### v2.8.2-hook-lead-curve
+
+Tuning chỉ áp dụng cho artifact hook. Maximum horizontal prediction horizon
+tăng từ 90 lên 120 ms để đón xa hơn; cách đo root velocity, EMA 0.30, speed
+weight liên tục và giới hạn 12 m/s giữ nguyên. Tốc độ correction giảm nhẹ:
+`Kp=7.0`, cap mỗi trục từ `0.13 rad/s` ở 64 px trở xuống tới `0.23 rad/s` ở
+300 px trở lên. Phần giữa dùng smoothstep thay vì linear để tâm vẫn đi nhanh
+khi xa nhưng giảm đều khi tiến gần, không có góc đổi tốc độ tại hai ngưỡng.
+Tại thời điểm thử nghiệm, bản poll vẫn giữ 90 ms, `Kp=7.5` và cap linear
+0.15–0.25 rad/s.
+
+### v2.8.2-poll-lead-curve
+
+Theo kết quả trải nghiệm, nhánh hook bị loại bỏ khỏi source, build script và
+artifact; ghi chú hook ở trên chỉ được giữ làm lịch sử. Runtime quay lại lịch
+poll adaptive `5000/500/8 ms`, không sửa executable code page.
+
+Phần tuning đã thử trên hook được chuyển sang bản poll: maximum horizontal
+prediction horizon 120 ms, `Kp=7.0`, cap mỗi trục dùng smoothstep từ
+`0.13 rad/s` tại 64 px trở xuống tới `0.23 rad/s` tại 300 px trở lên. Mục tiêu
+là đón target chạy xa hơn nhưng giảm tốc camera đều khi tâm tiến gần. Version
+code 284.
+
+Build release đạt **70/70 test ARM64**. ZIP SHA-256
+`595D9107CF46E14603DAE24DD5E83B808A14164B83291C0ACD1B0558B499DCCD`;
+payload `3b46c5a24ae52c96d618f7be342812b87e122245303945d5ca69e25bdba27f19`
+và loader `e25ae04142320432dc9570a31fba5353db3001f9ee83c32d4e3ef7861aacf8fe`.
+Bản đã cài và reboot trên `192.168.5.102:5555`; game PID 6434 ổn định,
+Unity/IL2CPP được nạp và không có fatal log. Callsite hook cũ tại IL2CPP RVA
+`0x889b64c` đã trở lại instruction gốc `0x9400000d`
+(`BL WNWeaponSniper.T_OnZooming`), xác nhận bản poll không redirect method.
+
+### v2.8.3-poll-linear-lead
+
+Live probe của v2.8.2 ghi nhận trong 20 giây có 1573 lần prediction và 1558
+lệnh gyro active. Tốc độ target thường khoảng 1.4–2.5 m/s, tối đa 3.347 m/s;
+do horizon cũ còn nhân `speed / 12`, phần lớn lần chạy chỉ thực sự dùng 14–25
+ms dù giới hạn danh nghĩa là 120 ms. Lead lớn nhất quan sát được là 56.88 px.
+Probe cũng thấy predictor thường quay về sample đầu sau khi trigger chớp false
+rồi true trên cùng target.
+
+Logic mới dùng horizon cố định 60 ms khi filtered speed đạt 0.80 m/s, vì vậy
+khoảng lead tăng tuyến tính theo velocity. Chỉ vùng nhiễu thấp dùng smoothstep:
+0 tại 0.25 m/s trở xuống và đạt đầy đủ tại 0.80 m/s; raw velocity vẫn bị giới
+hạn an toàn ở 12 m/s. Khi cùng target được reacquire trong grace 250 ms, cycle
+mới giữ lại predictor/EMA thay vì bắt đầu velocity từ zero. Version code 285.
+
+Build release đạt **71/71 test ARM64**. ZIP SHA-256
+`6D4C0C262C05D6BA679D68AC891400E3B2E358FAB0B09D0CA9AFAA0448FDE0E1`;
+payload `bfbc92040d0aa4dfd44f9ff407967abd5cded4699bd2dcf9be9a9f15d27665ae`.
+Bản đã cài và reboot trên `192.168.5.102:5555`; module active đúng versionCode
+285, game PID 5547 ổn định, không có named module map hoặc fatal log.
+
+### v2.8.4-poll-linear-lead (game update 2026-09-22)
+
+Game CrossFire Legends cập nhật lên version `1.0.19.90` (versionCode 49).
+Module được cập nhật lại theo profile mới:
+- Unity build ID: `1304f8f523fbba8d98ab8d775ae4e3d696efdb04` (cũ: `1a60ff52...`)
+- IL2CPP build ID: `33384ad3538f357d057987fa88c9f4eba485e563` (cũ: `a8793b51...`)
+- RVA cờ registration readiness: `0xc698140` (cũ: `0xbe000e0`), xác minh trực tiếp trên game qua Frida đọc giá trị = 1
+- RVA `Pawn.get_CurrentWeapon()`: `0x416ae50` (cũ: `0x6876c98`), giải mã trực tiếp từ con trỏ MethodInfo trong runtime
+- Toàn bộ 10 class và 10 key field (`m_CachedUpperBodyTransform`, `m_DoingAimAssist`, `m_IsZooming`, `m_WorldCamera`...) đã được đối chiếu qua live probe — 100% nguyên vẹn.
+- Version code 286.
+
+Build release đạt **71/71 test ARM64**. ZIP SHA-256
+`0493FB872C3D6DB003D93AC4EBFA17C1B80CC809E7E7610D1626B7C8CABDC8D4`;
+payload `da507e2e6a4428d36ba6e6519877ce27e805a557287aec9e836a8481339e8c58`.
+
+### v2.8.5-spectator-guard
+
+Live read-only sampling captured the complete round transition. While the
+local player was spectating, `PlayerController.m_IsSpectating = 1`,
+`PlayerInfo.m_IsSpectating = 1`, `m_LocalPlayerRespawnState = 2`, the local
+pawn health sentinel was `-4`, and `m_ViewTarget` pointed to the observed pawn.
+At the next live round both spectator flags became zero, respawn state became
+1, and health returned to 100. The cached scene now resolves and reads the
+controller spectator flag before weapon classification. A true flag clears the
+cached sniper and returns an inactive snapshot on the 500 ms cadence, causing
+the gyro controller to reset immediately while still detecting the next round.
+
+Release verification: **72/72 ARM64 tests passed** and `git diff --check`
+reported no errors. ZIP SHA-256:
+`98BBAE45415BF0F85FAA9A380D521104D436BA9EACA89ED3EC6E52AF93D98E4E`;
+packaged payload SHA-256:
+`968D5D94B66E61787A8D3FD038F5A8DAAC0FB79A537B643771A2896912F189`.
+
+Installed on `192.168.5.102:5555` through KernelSU and rebooted. KernelSU
+reported the enabled module as `2.8.5-spectator-guard` / `versionCode=287`.
+The device-side payload SHA-256 matched the packaged payload, and the game
+started normally after reboot without a new fatal signal.

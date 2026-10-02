@@ -1,6 +1,6 @@
 id=rt_shim
 name=Runtime Shim
-version=2.6.0-adaptive-poll
-versionCode=260
+version=2.8.5-spectator-guard
+versionCode=287
 author=local
-description=Sniper gyro aim with direct weapon/zoom gates, adaptive 5000/500/8 ms polling, and 500 ms finish grace.
+description=Polling sniper gyro with spectator guard, linear velocity lead, low-speed noise gating, and eased pull speed.

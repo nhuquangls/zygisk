@@ -41,6 +41,7 @@ $Required = @(
     (Join-Path $NativeSource 'aim_math.c'),
     (Join-Path $NativeSource 'aim_policy.c'),
     (Join-Path $NativeSource 'gyro_controller.c'),
+    (Join-Path $NativeSource 'gyro_ramp.c'),
     (Join-Path $NativeSource 'scene_snapshot.c'),
     (Join-Path $NativeSource 'android_input.c'),
     (Join-Path $NativeSource 'sensor_probe.c'),

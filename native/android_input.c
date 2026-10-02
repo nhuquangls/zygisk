@@ -142,7 +142,7 @@ static jlong poll(JNIEnv *env, jclass cl, jfloatArray output, jint width, jint h
                 if (candidate->id != desired) continue;
                 CfVec3 measured = candidate->head, predicted;
                 if (cf_target_predict(&g_predictor, candidate->id, &measured,
-                                      snapshot.time_ns, &predicted))
+                                      &measured, snapshot.time_ns, &predicted))
                     candidate->head = predicted;
                 CfViewport viewport = {(float)width, (float)height};
                 CfAimResult result;
